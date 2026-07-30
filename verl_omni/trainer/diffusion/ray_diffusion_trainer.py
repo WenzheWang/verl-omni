@@ -1033,7 +1033,7 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                                 metrics.update({"perf/mfu/actor_infer": old_log_prob_mfu})
                             batch = batch.union(old_log_prob)
 
-                    assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
+                    assert "old_log_probs" in batch.batch, f'"old_log_probs" not in {batch.batch.keys()=}'
 
                     metrics.update(
                         compute_rollout_corr_metrics_from_batch(
