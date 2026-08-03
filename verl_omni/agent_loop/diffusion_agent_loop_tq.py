@@ -36,6 +36,11 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
+async def _settle_session_tasks(tasks: list[asyncio.Task[Any]]) -> list[BaseException]:
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    return [result for result in results if isinstance(result, BaseException)]
+
+
 @ray.remote
 class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
     """TransferQueue-backed diffusion agent loop worker."""
@@ -126,10 +131,10 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
         uid = prompt["uid"]
         partition_id = "val" if trajectory["validate"] else "train"
         await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "running"})
+        tasks = []
         try:
             config = self.rollout_config
             n = config.val_kwargs.n if trajectory["validate"] else config.n
-            tasks = []
             for session_id in range(n):
                 run_sampling_params = dict(sampling_params)
                 if rollout_base_seed is not None and not trajectory["validate"]:
@@ -143,10 +148,22 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
                     )
                 )
                 tasks.append(task)
-            await asyncio.gather(*tasks)
-            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "finished"})
-        except Exception as e:
-            logger.exception(f"Error in _run_prompt for uid={uid}: {e}")
+
+            session_errors = await _settle_session_tasks(tasks)
+            if session_errors:
+                for error in session_errors:
+                    logger.error(
+                        f"Error in _run_prompt for uid={uid}",
+                        exc_info=(type(error), error, error.__traceback__),
+                    )
+                status = "failure"
+            else:
+                status = "finished"
+            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": status})
+        except Exception:
+            logger.exception(f"Error in _run_prompt for uid={uid}")
+            if tasks:
+                await _settle_session_tasks(tasks)
             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
 
     async def _run_agent_loop(
@@ -160,7 +177,10 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
     ) -> None:
         """Run one diffusion agent loop session and write its output to TransferQueue."""
         internal: _InternalDiffusionAgentLoopOutput = await super()._run_agent_loop(
-            sampling_params, agent_name=agent_name, **kwargs
+            sampling_params,
+            agent_name=agent_name,
+            validate=trajectory["validate"] if trajectory else False,
+            **kwargs,
         )
         uid = kwargs["uid"]
         non_conflicting_kwargs = {k: v for k, v in kwargs.items() if k not in {"uid", "global_steps"}}
