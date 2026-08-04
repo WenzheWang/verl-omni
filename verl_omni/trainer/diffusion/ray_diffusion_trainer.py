@@ -109,7 +109,11 @@ def compute_advantage(
         "config": config,
     }
     if "uid" in data.non_tensor_batch:
-        adv_kwargs["index"] = data.non_tensor_batch["uid"]
+        raw_uid = data.non_tensor_batch["uid"]
+        adv_kwargs["index"] = np.array(
+            [str(item.data) if hasattr(item, "data") and not isinstance(item, str) else str(item) for item in raw_uid],
+            dtype=object,
+        )
     if "reward_baselines" in data.batch:
         adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
 
