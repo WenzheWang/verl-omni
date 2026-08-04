@@ -22,7 +22,7 @@ from verl.protocol import DataProto
 
 from verl_omni.agent_loop import diffusion_agent_loop_tq
 from verl_omni.agent_loop.diffusion_agent_loop import DiffusionAgentLoopOutput, DiffusionAgentLoopWorker
-from verl_omni.agent_loop.diffusion_agent_loop_tq import DiffusionAgentLoopWorkerTQ, _settle_session_tasks
+from verl_omni.agent_loop.diffusion_agent_loop_tq import DiffusionAgentLoopWorkerTQImpl
 
 
 class _FakeRemoteComputeScore:
@@ -47,29 +47,8 @@ class _DummyDiffusionAgentLoopWorker:
 
 
 @pytest.mark.asyncio
-async def test_settle_session_tasks_waits_for_siblings_after_failure():
-    sibling_settled = asyncio.Event()
-
-    async def fail():
-        raise RuntimeError("session failed")
-
-    async def finish_later():
-        await asyncio.sleep(0.01)
-        sibling_settled.set()
-
-    tasks = [asyncio.create_task(fail()), asyncio.create_task(finish_later())]
-    errors = await _settle_session_tasks(tasks)
-
-    assert sibling_settled.is_set()
-    assert all(task.done() for task in tasks)
-    assert len(errors) == 1
-    assert isinstance(errors[0], RuntimeError)
-
-
-@pytest.mark.asyncio
 async def test_run_prompt_publishes_failure_after_siblings_settle(monkeypatch):
-    worker_cls = DiffusionAgentLoopWorkerTQ.__ray_metadata__.modified_class
-    worker = object.__new__(worker_cls)
+    worker = object.__new__(DiffusionAgentLoopWorkerTQImpl)
     worker.rollout_config = SimpleNamespace(n=2, val_kwargs=SimpleNamespace(n=2))
     lifecycle = []
 
