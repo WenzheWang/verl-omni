@@ -263,7 +263,9 @@ class DiffusionAgentLoopWorkerTQImpl(DiffusionAgentLoopWorker):
         )
 
 
-DiffusionAgentLoopWorkerTQ = ray.remote(DiffusionAgentLoopWorkerTQImpl)
+@ray.remote
+class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorkerTQImpl):
+    """Ray actor wrapper for the TransferQueue-backed diffusion worker."""
 
 
 @auto_await
