@@ -36,7 +36,8 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
-class DiffusionAgentLoopWorkerTQImpl(DiffusionAgentLoopWorker):
+@ray.remote
+class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
     """TransferQueue-backed diffusion agent loop worker."""
 
     def __init__(self, *args, **kwargs):
@@ -261,11 +262,6 @@ class DiffusionAgentLoopWorkerTQImpl(DiffusionAgentLoopWorker):
             tags=tags,
             partition_id=partition_id,
         )
-
-
-@ray.remote
-class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorkerTQImpl):
-    """Ray actor wrapper for the TransferQueue-backed diffusion worker."""
 
 
 @auto_await

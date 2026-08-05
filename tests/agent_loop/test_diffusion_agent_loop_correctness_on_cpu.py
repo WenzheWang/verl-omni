@@ -22,7 +22,7 @@ from verl.protocol import DataProto
 
 from verl_omni.agent_loop import diffusion_agent_loop_tq
 from verl_omni.agent_loop.diffusion_agent_loop import DiffusionAgentLoopOutput, DiffusionAgentLoopWorker
-from verl_omni.agent_loop.diffusion_agent_loop_tq import DiffusionAgentLoopWorkerTQImpl
+from verl_omni.agent_loop.diffusion_agent_loop_tq import DiffusionAgentLoopWorkerTQ
 
 
 class _FakeRemoteComputeScore:
@@ -48,7 +48,8 @@ class _DummyDiffusionAgentLoopWorker:
 
 @pytest.mark.asyncio
 async def test_run_prompt_publishes_failure_after_siblings_settle(monkeypatch):
-    worker = object.__new__(DiffusionAgentLoopWorkerTQImpl)
+    worker_cls = DiffusionAgentLoopWorkerTQ.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
     worker.rollout_config = SimpleNamespace(n=2, val_kwargs=SimpleNamespace(n=2))
     lifecycle = []
 
