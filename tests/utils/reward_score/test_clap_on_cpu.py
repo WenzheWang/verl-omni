@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests for the generic CLAP reward scorer."""
+"""CPU tests for CLAP burst batching."""
 
+import asyncio
 import importlib.util
 import sys
 from pathlib import Path
@@ -26,6 +27,7 @@ def _load_scorer_module():
     module_path = Path(__file__).parents[3] / "verl_omni/utils/reward_score/clap.py"
     spec = importlib.util.spec_from_file_location("clap_reward_under_test", module_path)
     module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
 
@@ -45,33 +47,177 @@ def test_get_audio_normalizes_batch_and_channels():
     assert sample_rate == 48_000
 
 
-def test_compute_score_uses_generic_reward_interface(monkeypatch):
+class _FakeProcessor:
+    def __init__(self):
+        self.batches = []
+
+    def __call__(self, *, text, audio, sampling_rate, **kwargs):
+        assert sampling_rate == 48_000
+        self.batches.append((list(text), [waveform.copy() for waveform in audio]))
+        prompt_features = {"right": [1.0, 0.0], "up": [0.0, 1.0]}
+        return {
+            "audio_values": torch.stack([torch.from_numpy(waveform[:2]) for waveform in audio]),
+            "text_values": torch.tensor([prompt_features[prompt] for prompt in text]),
+        }
+
+
+class _FakeModel:
+    def __call__(self, audio_values, text_values):
+        return SimpleNamespace(audio_embeds=audio_values, text_embeds=text_values)
+
+
+def _install_fake_torchaudio(monkeypatch):
+    resample_calls = []
+
+    def resample(waveform, *, orig_freq, new_freq):
+        resample_calls.append((orig_freq, new_freq))
+        return waveform
+
     functional = ModuleType("torchaudio.functional")
-    functional.resample = lambda waveform, **kwargs: waveform
+    functional.resample = resample
     torchaudio = ModuleType("torchaudio")
     torchaudio.functional = functional
     monkeypatch.setitem(sys.modules, "torchaudio", torchaudio)
     monkeypatch.setitem(sys.modules, "torchaudio.functional", functional)
+    return resample_calls
 
-    class FakeProcessor:
-        def __call__(self, **kwargs):
-            assert kwargs["text"] == ["forest ambience"]
-            return {"input_values": torch.ones(1, 4)}
 
-    class FakeModel:
-        def __call__(self, **kwargs):
-            return SimpleNamespace(
-                audio_embeds=torch.tensor([[3.0, 4.0]]),
-                text_embeds=torch.tensor([[0.0, 5.0]]),
-            )
+def _reset_consumer(monkeypatch):
+    queue = asyncio.Queue(maxsize=clap._MAX_BATCH_SIZE)
+    monkeypatch.setattr(clap, "_score_queue", queue)
+    monkeypatch.setattr(clap, "_consumer_task", None)
+    monkeypatch.setattr(clap, "_consumer_lock", asyncio.Lock())
+    return queue
 
-    monkeypatch.setattr(clap, "_load_clap", lambda model_name_or_path, device: (FakeModel(), FakeProcessor()))
-    result = clap.compute_score(
+
+async def _stop_consumer(queue):
+    queue.put_nowait((None, None, None, None, None))
+    await clap._consumer_task
+
+
+def _score(prompt, waveform, sample_rate=48_000, **kwargs):
+    return clap.compute_score(
         data_source="test",
         solution_image=None,
-        ground_truth="forest ambience",
-        extra_info={"audio": torch.ones(16), "audio_sample_rate": 48_000},
+        ground_truth=prompt,
+        extra_info={"audio": torch.tensor(waveform), "audio_sample_rate": sample_rate},
         device="cpu",
+        **kwargs,
     )
 
-    assert result == {"score": pytest.approx(0.8), "source_sample_rate": 48_000}
+
+def test_score_queue_is_bounded():
+    assert clap._score_queue.maxsize == clap._MAX_BATCH_SIZE
+
+
+@pytest.mark.parametrize("termination", ["finished", "cancelled"])
+@pytest.mark.asyncio
+async def test_ensure_consumer_restarts_stopped_task(monkeypatch, termination):
+    queue = _reset_consumer(monkeypatch)
+    await clap._ensure_consumer()
+    first_task = clap._consumer_task
+
+    if termination == "finished":
+        await queue.put((None, None, None, None, None))
+        await first_task
+    else:
+        first_task.cancel()
+        await asyncio.gather(first_task, return_exceptions=True)
+
+    await clap._ensure_consumer()
+    second_task = clap._consumer_task
+
+    assert second_task is not first_task
+    assert not second_task.done()
+    await _stop_consumer(queue)
+
+
+@pytest.mark.asyncio
+async def test_compute_score_batches_burst_requests_and_preserves_order(monkeypatch):
+    _install_fake_torchaudio(monkeypatch)
+    queue = _reset_consumer(monkeypatch)
+    processor = _FakeProcessor()
+    monkeypatch.setattr(clap, "_load_clap", lambda model_name_or_path, device: (_FakeModel(), processor))
+
+    results = await asyncio.gather(
+        _score("right", [1.0, 0.0]),
+        _score("up", [0.0, 1.0]),
+        _score("right", [1.0, 1.0]),
+        _score("up", [1.0, -1.0]),
+    )
+    await _stop_consumer(queue)
+
+    assert len(processor.batches) == 1
+    assert processor.batches[0][0] == ["right", "up", "right", "up"]
+    assert [result["score"] for result in results] == pytest.approx([1.0, 1.0, 2**-0.5, -(2**-0.5)])
+    assert [result["source_sample_rate"] for result in results] == [48_000] * 4
+
+
+@pytest.mark.asyncio
+async def test_consumer_caps_each_micro_batch(monkeypatch):
+    _install_fake_torchaudio(monkeypatch)
+    queue = _reset_consumer(monkeypatch)
+    processor = _FakeProcessor()
+    monkeypatch.setattr(clap, "_load_clap", lambda model_name_or_path, device: (_FakeModel(), processor))
+    monkeypatch.setattr(clap, "_MAX_BATCH_SIZE", 2)
+
+    results = await asyncio.gather(*(_score("right", [1.0, float(index)]) for index in range(5)))
+    await _stop_consumer(queue)
+
+    assert [len(prompts) for prompts, _ in processor.batches] == [2, 2, 1]
+    assert len(results) == 5
+
+
+@pytest.mark.asyncio
+async def test_consumer_groups_requests_by_model_and_device(monkeypatch):
+    _install_fake_torchaudio(monkeypatch)
+    queue = _reset_consumer(monkeypatch)
+    processors = {"model-a": _FakeProcessor(), "model-b": _FakeProcessor()}
+    load_calls = []
+
+    def load_clap(model_name_or_path, device):
+        load_calls.append((model_name_or_path, device))
+        return _FakeModel(), processors[model_name_or_path]
+
+    monkeypatch.setattr(clap, "_load_clap", load_clap)
+    results = await asyncio.gather(
+        _score("right", [1.0, 0.0], model_name_or_path="model-a"),
+        _score("up", [0.0, 1.0], model_name_or_path="model-b"),
+        _score("up", [0.0, 1.0], model_name_or_path="model-a"),
+        _score("right", [1.0, 0.0], model_name_or_path="model-b"),
+    )
+    await _stop_consumer(queue)
+
+    assert load_calls == [("model-a", "cpu"), ("model-b", "cpu")]
+    assert [len(processors[name].batches[0][0]) for name in ("model-a", "model-b")] == [2, 2]
+    assert [result["score"] for result in results] == pytest.approx([1.0] * 4)
+
+
+@pytest.mark.asyncio
+async def test_consumer_isolates_invalid_audio_and_resamples_valid_requests(monkeypatch):
+    resample_calls = _install_fake_torchaudio(monkeypatch)
+    queue = _reset_consumer(monkeypatch)
+    processor = _FakeProcessor()
+    monkeypatch.setattr(clap, "_load_clap", lambda model_name_or_path, device: (_FakeModel(), processor))
+
+    invalid = clap.compute_score(
+        data_source="test",
+        solution_image=None,
+        ground_truth="right",
+        extra_info={"audio_sample_rate": 48_000},
+        device="cpu",
+    )
+    results = await asyncio.gather(
+        _score("right", [1.0, 0.0], sample_rate=24_000),
+        invalid,
+        _score("up", [0.0, 1.0]),
+        return_exceptions=True,
+    )
+    await _stop_consumer(queue)
+
+    assert results[0] == {"score": pytest.approx(1.0), "source_sample_rate": 24_000}
+    assert isinstance(results[1], KeyError)
+    assert results[2] == {"score": pytest.approx(1.0), "source_sample_rate": 48_000}
+    assert resample_calls == [(24_000, 48_000)]
+    assert len(processor.batches) == 1
+    assert len(processor.batches[0][0]) == 2
