@@ -18,7 +18,7 @@ import math
 import os
 import uuid
 from abc import ABC, abstractmethod
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pprint import pprint
 
@@ -68,7 +68,6 @@ from verl_omni.trainer.diffusion.rollout_correction import (
     compute_rollout_corr_metrics_from_batch,
     rollout_correction_enabled,
 )
-from verl_omni.trainer.diffusion.v1.replay_buffer import DiffusionReplayBuffer
 from verl_omni.trainer.diffusion.v1.tq_utils import (
     diffusion_tq_batch_to_dataproto,
     sort_diffusion_tq_keys,
@@ -130,23 +129,19 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
     def _build_replay_buffer(self) -> ReplayBuffer:
         sampler_config = self.config.trainer.v1.sampler
-        replay_buffer_kwargs = {
-            "trainer_mode": self.trainer_mode,
-            "trainer_config": self.config.trainer.v1.get(self.trainer_mode, {}),
-            "max_off_policy_threshold": sampler_config.max_off_policy_threshold,
-            "max_off_policy_strategy": sampler_config.max_off_policy_strategy,
-            "sampler_kwargs": sampler_config.sampler_kwargs,
-        }
-        drop_incomplete_groups = sampler_config.get("drop_incomplete_groups", False)
-        if not drop_incomplete_groups:
-            return ReplayBuffer(**replay_buffer_kwargs)
+        max_refill_rounds = sampler_config.get("max_incomplete_group_refill_rounds", 3)
+        if sampler_config.get("drop_incomplete_groups", False):
+            if self.trainer_mode != "sync":
+                raise ValueError("drop_incomplete_groups is only supported with trainer_mode='sync'")
+            if isinstance(max_refill_rounds, bool) or not isinstance(max_refill_rounds, int) or max_refill_rounds <= 0:
+                raise ValueError("max_incomplete_group_refill_rounds must be a positive integer")
 
-        return DiffusionReplayBuffer(
-            **replay_buffer_kwargs,
-            refill_fn=self._add_prompts_to_generate,
-            drop_incomplete_groups=drop_incomplete_groups,
-            max_incomplete_group_refill_rounds=sampler_config.get("max_incomplete_group_refill_rounds", 3),
-            train_batch_size=self.config.data.train_batch_size,
+        return ReplayBuffer(
+            trainer_mode=self.trainer_mode,
+            trainer_config=self.config.trainer.v1.get(self.trainer_mode, {}),
+            max_off_policy_threshold=sampler_config.max_off_policy_threshold,
+            max_off_policy_strategy=sampler_config.max_off_policy_strategy,
+            sampler_kwargs=sampler_config.sampler_kwargs,
         )
 
     def init(self):
@@ -273,11 +268,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         """Sample one mini-batch from the replay buffer and run the diffusion PG pipeline."""
         with marked_timer("gen", timing_raw, color="red"):
             self.on_sample_begin()
-            batch_meta, off_policy_metrics = self.replay_buffer.sample(
-                global_steps=self.global_steps,
-                partition_id="train",
-                batch_size=sample_batch_size,
-            )
+            batch_meta, off_policy_metrics = self._sample_training_batch(sample_batch_size)
             metrics.update(off_policy_metrics)
             self.on_sample_end()
 
@@ -699,6 +690,87 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         if rollout_seed_cfg is not None:
             tu.assign_non_tensor_data(batch, "rollout_seed", int(rollout_seed_cfg) + self.global_steps - 1)
         return batch
+
+    @staticmethod
+    def _trajectory_uid(key: str) -> str:
+        parts = key.rsplit("_", 2)
+        return parts[0] if len(parts) == 3 else key
+
+    def _sample_training_batch(self, batch_size: int) -> tuple[KVBatchMeta, dict]:
+        """Use the upstream replay buffer and replace only selected failed groups."""
+        sampler_config = self.config.trainer.v1.sampler
+        if not sampler_config.get("drop_incomplete_groups", False):
+            return self.replay_buffer.sample(
+                global_steps=self.global_steps,
+                partition_id="train",
+                batch_size=batch_size,
+            )
+
+        max_refill_rounds = sampler_config.get("max_incomplete_group_refill_rounds", 3)
+        remaining_batch_size = batch_size
+        refill_rounds = 0
+        keys: list[str] = []
+        tags: list[dict] = []
+        sampling_metrics: dict = {}
+        failure_metrics: Counter = Counter()
+
+        while remaining_batch_size > 0:
+            batch, current_metrics = self.replay_buffer.sample(
+                global_steps=self.global_steps,
+                partition_id="train",
+                batch_size=remaining_batch_size,
+            )
+            sampling_metrics.update(current_metrics)
+
+            prompt_global_steps = self.replay_buffer.prompt_global_steps["train"]
+            sampleable_uids = sorted(
+                self.replay_buffer.finished_keys["train"] | self.replay_buffer.failure_keys["train"],
+                key=lambda uid: prompt_global_steps.get(uid, 0),
+            )
+            selected_uids = set(sampleable_uids[:remaining_batch_size])
+            failed_uids = selected_uids & self.replay_buffer.failure_keys["train"]
+            if not failed_uids:
+                keys.extend(batch.keys)
+                tags.extend(batch.tags)
+                break
+
+            if refill_rounds >= max_refill_rounds:
+                raise RuntimeError(
+                    f"Exceeded max_incomplete_group_refill_rounds={max_refill_rounds} "
+                    "while replacing failed rollout groups"
+                )
+
+            num_failed = len(failed_uids)
+            for key, tag in zip(batch.keys, batch.tags, strict=False):
+                if self._trajectory_uid(key) not in failed_uids:
+                    keys.append(key)
+                    tags.append(tag)
+
+            failed_trajectory_keys = [
+                key
+                for key in self.replay_buffer.partitions["train"]
+                if self._trajectory_uid(key) in failed_uids
+            ]
+            tq.kv_clear(partition_id="train", keys=[*failed_uids, *failed_trajectory_keys])
+
+            refilled = self._add_prompts_to_generate(num_failed)
+            if refilled != num_failed:
+                raise RuntimeError(f"refill submitted {refilled} prompts, expected {num_failed}")
+
+            refill_rounds += 1
+            remaining_batch_size = num_failed
+            failure_metrics["training/rollout_failure/evicted_groups"] += num_failed
+            failure_metrics["training/rollout_failure/evicted_trajectories"] += len(failed_trajectory_keys)
+            failure_metrics["training/rollout_failure/refilled_prompts"] += refilled
+            failure_metrics["training/rollout_failure/refill_rounds"] += 1
+            logger.warning(
+                "Evicted %d incomplete rollout groups and submitted exact replacements (round %d/%d)",
+                num_failed,
+                refill_rounds,
+                max_refill_rounds,
+            )
+
+        return KVBatchMeta(partition_id="train", keys=keys, tags=tags), {**sampling_metrics, **failure_metrics}
 
     def _submit_batch_to_rollout(self, batch) -> int:
         tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))]

@@ -158,32 +158,12 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
                     exc_info=(type(error), error, error.__traceback__),
                 )
             status = "failure" if errors else "finished"
-            terminal_tag = {"status": status}
-            if errors:
-                if any(isinstance(error, asyncio.CancelledError) for error in errors):
-                    terminal_tag["failure_reason"] = "cancelled"
-                elif any(isinstance(error, TimeoutError) for error in errors):
-                    terminal_tag["failure_reason"] = "timeout"
-                elif any(isinstance(error, RuntimeError) for error in errors):
-                    terminal_tag["failure_reason"] = "runtime_error"
-                else:
-                    terminal_tag["failure_reason"] = "error"
-            await tq.async_kv_put(key=uid, partition_id=partition_id, tag=terminal_tag)
+            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": status})
         except Exception as e:
             logger.exception(f"Error in _run_prompt for uid={uid}: {e}")
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
-            if isinstance(e, TimeoutError):
-                failure_reason = "timeout"
-            elif isinstance(e, RuntimeError):
-                failure_reason = "runtime_error"
-            else:
-                failure_reason = "error"
-            await tq.async_kv_put(
-                key=uid,
-                partition_id=partition_id,
-                tag={"status": "failure", "failure_reason": failure_reason},
-            )
+            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
 
     async def _run_agent_loop(
         self,

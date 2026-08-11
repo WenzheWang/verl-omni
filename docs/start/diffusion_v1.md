@@ -102,9 +102,8 @@ checkpoints/flow_grpo/sd35_medium_ocr_lora_v1
   replacement prompts. This policy is supported only with
   `trainer.v1.trainer_mode=sync`; validation sampling is unchanged.
 - `trainer.v1.sampler.max_incomplete_group_refill_rounds` bounds consecutive
-  replacement rounds within one replay-buffer sample call. Total replacement
-  prompts are also capped at this value times `data.train_batch_size`. Exact
-  refill uses a generation batch size of one while the policy is enabled.
+  replacement rounds within one training sample call. Exact refill uses a
+  generation batch size of one while the policy is enabled.
 - `transfer_queue.backend.SimpleStorage.total_storage_size` controls the
   maximum number of experience samples held by the default backend.
 - `transfer_queue.backend.SimpleStorage.num_data_storage_units` controls the
