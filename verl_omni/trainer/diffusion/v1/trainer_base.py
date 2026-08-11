@@ -44,6 +44,7 @@ from verl.single_controller.ray import (
 from verl.trainer.ppo.metric_utils import compute_variance_proxy_metrics, process_validation_metrics
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import Role, need_reference_policy, need_reward_model
+from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.config import omega_conf_to_dataclass
@@ -127,16 +128,23 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         self.checkpoint_manager = None
         self.global_steps = 0
 
-    def _build_replay_buffer(self) -> DiffusionReplayBuffer:
+    def _build_replay_buffer(self) -> ReplayBuffer:
         sampler_config = self.config.trainer.v1.sampler
+        replay_buffer_kwargs = {
+            "trainer_mode": self.trainer_mode,
+            "trainer_config": self.config.trainer.v1.get(self.trainer_mode, {}),
+            "max_off_policy_threshold": sampler_config.max_off_policy_threshold,
+            "max_off_policy_strategy": sampler_config.max_off_policy_strategy,
+            "sampler_kwargs": sampler_config.sampler_kwargs,
+        }
+        drop_incomplete_groups = sampler_config.get("drop_incomplete_groups", False)
+        if not drop_incomplete_groups:
+            return ReplayBuffer(**replay_buffer_kwargs)
+
         return DiffusionReplayBuffer(
-            trainer_mode=self.trainer_mode,
-            trainer_config=self.config.trainer.v1.get(self.trainer_mode, {}),
-            max_off_policy_threshold=sampler_config.max_off_policy_threshold,
-            max_off_policy_strategy=sampler_config.max_off_policy_strategy,
-            sampler_kwargs=sampler_config.sampler_kwargs,
+            **replay_buffer_kwargs,
             refill_fn=self._add_prompts_to_generate,
-            drop_incomplete_groups=sampler_config.get("drop_incomplete_groups", False),
+            drop_incomplete_groups=drop_incomplete_groups,
             max_incomplete_group_refill_rounds=sampler_config.get("max_incomplete_group_refill_rounds", 3),
             train_batch_size=self.config.data.train_batch_size,
         )

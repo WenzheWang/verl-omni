@@ -49,6 +49,8 @@ class DiffusionReplayBuffer(ReplayBuffer):
         self.max_incomplete_group_refill_rounds = max_incomplete_group_refill_rounds
         self.train_batch_size = train_batch_size
 
+        if self.drop_incomplete_groups and self.trainer_mode != "sync":
+            raise ValueError("drop_incomplete_groups is only supported with trainer_mode='sync'")
         if self.drop_incomplete_groups and self.refill_fn is None:
             raise ValueError("drop_incomplete_groups requires refill_fn")
         if (

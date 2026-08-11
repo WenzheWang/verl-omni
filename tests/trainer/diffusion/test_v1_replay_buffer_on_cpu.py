@@ -15,8 +15,10 @@
 import importlib.util
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from omegaconf import OmegaConf
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer
 
 
@@ -72,9 +74,9 @@ def _make_buffer(*, refill_fn, max_refill_rounds=3, train_batch_size=3):
     )
 
 
-def _make_default_buffer():
+def _make_default_buffer(trainer_mode="sync"):
     return DiffusionReplayBuffer(
-        trainer_mode="sync",
+        trainer_mode=trainer_mode,
         trainer_config={},
         max_off_policy_threshold=8,
         max_off_policy_strategy="drop",
@@ -83,9 +85,9 @@ def _make_default_buffer():
     )
 
 
-def _make_upstream_buffer():
+def _make_upstream_buffer(trainer_mode="sync"):
     return ReplayBuffer(
-        trainer_mode="sync",
+        trainer_mode=trainer_mode,
         trainer_config={},
         max_off_policy_threshold=8,
         max_off_policy_strategy="drop",
@@ -231,15 +233,48 @@ def test_validation_preserves_upstream_failure_sampling_without_refill(monkeypat
     assert refill_calls == []
 
 
-def test_disabled_policy_preserves_upstream_training_failure_sampling(monkeypatch):
+@pytest.mark.parametrize("trainer_mode", ["sync", "separate_async"])
+def test_disabled_policy_preserves_upstream_training_failure_sampling(monkeypatch, trainer_mode):
     fake_tq = _FakeTransferQueue({})
     fake_tq.add_group("failed", status="failure", trajectories=1, reason="runtime_error")
     _patch_transfer_queue(monkeypatch, fake_tq)
 
-    batch, metrics = _make_default_buffer().sample(global_steps=1, partition_id="train", batch_size=1)
+    batch, metrics = _make_default_buffer(trainer_mode).sample(
+        global_steps=1,
+        partition_id="train",
+        batch_size=1,
+    )
 
     assert batch.keys == ["failed_0_0"]
     assert metrics == {}
+
+
+@pytest.mark.parametrize("trainer_mode", ["sync", "separate_async"])
+def test_trainer_factory_uses_upstream_replay_buffer_when_policy_disabled(trainer_mode):
+    from verl_omni.trainer.diffusion.v1.trainer_base import PolicyGradientDiffusionTrainerV1
+
+    config = OmegaConf.create(
+        {
+            "data": {"train_batch_size": 2},
+            "trainer": {
+                "v1": {
+                    "trainer_mode": trainer_mode,
+                    trainer_mode: {"parameter_sync_step": 1},
+                    "sampler": {
+                        "max_off_policy_threshold": 8,
+                        "max_off_policy_strategy": "drop",
+                        "sampler_kwargs": {},
+                        "drop_incomplete_groups": False,
+                    },
+                }
+            },
+        }
+    )
+    trainer = SimpleNamespace(config=config, trainer_mode=trainer_mode)
+
+    replay_buffer = PolicyGradientDiffusionTrainerV1._build_replay_buffer(trainer)
+
+    assert type(replay_buffer) is ReplayBuffer
 
 
 def test_sample_rejects_non_exact_refill_result(monkeypatch):
@@ -269,6 +304,18 @@ def test_sample_rejects_refill_above_total_prompt_budget(monkeypatch):
 
 
 def test_init_rejects_missing_refill_fn_and_invalid_round_limit():
+    with pytest.raises(ValueError, match="only supported with trainer_mode='sync'"):
+        DiffusionReplayBuffer(
+            trainer_mode="separate_async",
+            trainer_config={},
+            max_off_policy_threshold=8,
+            max_off_policy_strategy="drop",
+            sampler_kwargs={},
+            refill_fn=lambda count: count,
+            drop_incomplete_groups=True,
+            train_batch_size=1,
+        )
+
     with pytest.raises(ValueError, match="drop_incomplete_groups requires refill_fn"):
         DiffusionReplayBuffer(
             trainer_mode="sync",

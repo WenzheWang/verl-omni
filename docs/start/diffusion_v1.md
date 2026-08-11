@@ -99,7 +99,8 @@ checkpoints/flow_grpo/sd35_medium_ocr_lora_v1
   count.
 - `trainer.v1.sampler.drop_incomplete_groups=true` evicts a training prompt
   group when any of its rollout sessions fails and submits the same number of
-  replacement prompts. Validation sampling is unchanged.
+  replacement prompts. This policy is supported only with
+  `trainer.v1.trainer_mode=sync`; validation sampling is unchanged.
 - `trainer.v1.sampler.max_incomplete_group_refill_rounds` bounds consecutive
   replacement rounds within one replay-buffer sample call. Total replacement
   prompts are also capped at this value times `data.train_batch_size`. Exact
@@ -109,8 +110,9 @@ checkpoints/flow_grpo/sd35_medium_ocr_lora_v1
 - `transfer_queue.backend.SimpleStorage.num_data_storage_units` controls the
   number of in-memory storage units.
 
-Only `sync` mode is currently implemented for the diffusion V1 trainer.
-`colocate_async` and `separate_async` are not yet supported.
+This guide and the incomplete-group refill policy cover `sync` mode.
+`separate_async` keeps the upstream replay-buffer behavior, while
+`colocate_async` is not yet supported.
 
 ## Troubleshooting
 
