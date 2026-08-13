@@ -16,6 +16,7 @@
 import asyncio
 import importlib.util
 import sys
+import threading
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -83,16 +84,13 @@ def _install_fake_torchaudio(monkeypatch):
 
 
 def _reset_consumer(monkeypatch):
-    queue = asyncio.Queue(maxsize=clap._MAX_BATCH_SIZE)
-    monkeypatch.setattr(clap, "_score_queue", queue)
-    monkeypatch.setattr(clap, "_consumer_task", None)
-    monkeypatch.setattr(clap, "_consumer_lock", asyncio.Lock())
-    return queue
+    monkeypatch.setattr(clap, "_BATCHING_STATE", threading.local())
+    return clap._get_batching_state()
 
 
-async def _stop_consumer(queue):
-    queue.put_nowait((None, None, None, None, None))
-    await clap._consumer_task
+async def _stop_consumer(state):
+    state.queue.put_nowait((None, None, None, None, None))
+    await state.consumer_task
 
 
 def _score(prompt, waveform, sample_rate=48_000, **kwargs):
@@ -106,36 +104,85 @@ def _score(prompt, waveform, sample_rate=48_000, **kwargs):
     )
 
 
-def test_score_queue_is_bounded():
-    assert clap._score_queue.maxsize == clap._MAX_BATCH_SIZE
+@pytest.mark.asyncio
+async def test_score_queue_is_bounded(monkeypatch):
+    state = _reset_consumer(monkeypatch)
+    assert state.queue.maxsize == clap._MAX_BATCH_SIZE
 
 
 @pytest.mark.parametrize("termination", ["finished", "cancelled"])
 @pytest.mark.asyncio
 async def test_ensure_consumer_restarts_stopped_task(monkeypatch, termination):
-    queue = _reset_consumer(monkeypatch)
-    await clap._ensure_consumer()
-    first_task = clap._consumer_task
+    state = _reset_consumer(monkeypatch)
+    await clap._ensure_consumer(state)
+    first_task = state.consumer_task
 
     if termination == "finished":
-        await queue.put((None, None, None, None, None))
+        await state.queue.put((None, None, None, None, None))
         await first_task
     else:
         first_task.cancel()
         await asyncio.gather(first_task, return_exceptions=True)
 
-    await clap._ensure_consumer()
-    second_task = clap._consumer_task
+    await clap._ensure_consumer(state)
+    second_task = state.consumer_task
 
     assert second_task is not first_task
     assert not second_task.done()
-    await _stop_consumer(queue)
+    await _stop_consumer(state)
+
+
+@pytest.mark.asyncio
+async def test_active_inference_cancellation_settles_all_requests(monkeypatch):
+    monkeypatch.setattr(clap, "_MAX_BATCH_SIZE", 2)
+    state = _reset_consumer(monkeypatch)
+    inference_started = threading.Event()
+    release_inference = threading.Event()
+
+    def blocking_score_batch(requests):
+        inference_started.set()
+        assert release_inference.wait(timeout=5)
+        return [(1.0, 48_000)] * len(requests)
+
+    monkeypatch.setattr(clap, "_score_batch", blocking_score_batch)
+    callers = [asyncio.create_task(_score("right", [1.0, 0.0])) for _ in range(4)]
+    assert await asyncio.to_thread(inference_started.wait, 5)
+    for _ in range(100):
+        if state.queue.qsize() == 2:
+            break
+        await asyncio.sleep(0.01)
+    assert state.queue.qsize() == 2
+
+    state.consumer_task.cancel()
+    release_inference.set()
+    results = await asyncio.wait_for(asyncio.gather(*callers, return_exceptions=True), timeout=5)
+    await asyncio.gather(state.consumer_task, return_exceptions=True)
+
+    assert all(isinstance(result, RuntimeError) for result in results)
+    assert all("cancelled" in str(result) for result in results)
+
+
+def test_batching_state_is_recreated_for_each_event_loop(monkeypatch):
+    monkeypatch.setattr(clap, "_BATCHING_STATE", threading.local())
+    monkeypatch.setattr(clap, "_score_batch", lambda requests: [(1.0, 48_000)] * len(requests))
+
+    async def run_once():
+        result = await _score("right", [1.0, 0.0])
+        state = clap._get_batching_state()
+        await _stop_consumer(state)
+        return result, state
+
+    first_result, first_state = asyncio.run(run_once())
+    second_result, second_state = asyncio.run(run_once())
+
+    assert first_result == second_result == {"score": 1.0, "source_sample_rate": 48_000}
+    assert first_state is not second_state
 
 
 @pytest.mark.asyncio
 async def test_compute_score_batches_burst_requests_and_preserves_order(monkeypatch):
     _install_fake_torchaudio(monkeypatch)
-    queue = _reset_consumer(monkeypatch)
+    state = _reset_consumer(monkeypatch)
     processor = _FakeProcessor()
     monkeypatch.setattr(clap, "_load_clap", lambda model_name_or_path, device: (_FakeModel(), processor))
 
@@ -145,7 +192,7 @@ async def test_compute_score_batches_burst_requests_and_preserves_order(monkeypa
         _score("right", [1.0, 1.0]),
         _score("up", [1.0, -1.0]),
     )
-    await _stop_consumer(queue)
+    await _stop_consumer(state)
 
     assert len(processor.batches) == 1
     assert processor.batches[0][0] == ["right", "up", "right", "up"]
@@ -156,13 +203,13 @@ async def test_compute_score_batches_burst_requests_and_preserves_order(monkeypa
 @pytest.mark.asyncio
 async def test_consumer_caps_each_micro_batch(monkeypatch):
     _install_fake_torchaudio(monkeypatch)
-    queue = _reset_consumer(monkeypatch)
+    state = _reset_consumer(monkeypatch)
     processor = _FakeProcessor()
     monkeypatch.setattr(clap, "_load_clap", lambda model_name_or_path, device: (_FakeModel(), processor))
     monkeypatch.setattr(clap, "_MAX_BATCH_SIZE", 2)
 
     results = await asyncio.gather(*(_score("right", [1.0, float(index)]) for index in range(5)))
-    await _stop_consumer(queue)
+    await _stop_consumer(state)
 
     assert [len(prompts) for prompts, _ in processor.batches] == [2, 2, 1]
     assert len(results) == 5
@@ -171,7 +218,7 @@ async def test_consumer_caps_each_micro_batch(monkeypatch):
 @pytest.mark.asyncio
 async def test_consumer_groups_requests_by_model_and_device(monkeypatch):
     _install_fake_torchaudio(monkeypatch)
-    queue = _reset_consumer(monkeypatch)
+    state = _reset_consumer(monkeypatch)
     processors = {"model-a": _FakeProcessor(), "model-b": _FakeProcessor()}
     load_calls = []
 
@@ -186,7 +233,7 @@ async def test_consumer_groups_requests_by_model_and_device(monkeypatch):
         _score("up", [0.0, 1.0], model_name_or_path="model-a"),
         _score("right", [1.0, 0.0], model_name_or_path="model-b"),
     )
-    await _stop_consumer(queue)
+    await _stop_consumer(state)
 
     assert load_calls == [("model-a", "cpu"), ("model-b", "cpu")]
     assert [len(processors[name].batches[0][0]) for name in ("model-a", "model-b")] == [2, 2]
@@ -196,7 +243,7 @@ async def test_consumer_groups_requests_by_model_and_device(monkeypatch):
 @pytest.mark.asyncio
 async def test_consumer_isolates_invalid_audio_and_resamples_valid_requests(monkeypatch):
     resample_calls = _install_fake_torchaudio(monkeypatch)
-    queue = _reset_consumer(monkeypatch)
+    state = _reset_consumer(monkeypatch)
     processor = _FakeProcessor()
     monkeypatch.setattr(clap, "_load_clap", lambda model_name_or_path, device: (_FakeModel(), processor))
 
@@ -213,7 +260,7 @@ async def test_consumer_isolates_invalid_audio_and_resamples_valid_requests(monk
         _score("up", [0.0, 1.0]),
         return_exceptions=True,
     )
-    await _stop_consumer(queue)
+    await _stop_consumer(state)
 
     assert results[0] == {"score": pytest.approx(1.0), "source_sample_rate": 24_000}
     assert isinstance(results[1], KeyError)

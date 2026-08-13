@@ -29,12 +29,27 @@ _DEFAULT_MODEL = "laion/larger_clap_general"
 _MAX_BATCH_SIZE = 16
 _MODEL_CACHE = {}
 _MODEL_LOCK = threading.Lock()
-_score_queue = asyncio.Queue(maxsize=_MAX_BATCH_SIZE)
-_consumer_task = None
-_consumer_lock = asyncio.Lock()
+_BATCHING_STATE = threading.local()
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
+class _BatchingState:
+    def __init__(self, loop):
+        self.loop = loop
+        self.queue = asyncio.Queue(maxsize=_MAX_BATCH_SIZE)
+        self.consumer_task = None
+        self.consumer_lock = asyncio.Lock()
+
+
+def _get_batching_state() -> _BatchingState:
+    loop = asyncio.get_running_loop()
+    state = getattr(_BATCHING_STATE, "value", None)
+    if state is None or state.loop is not loop:
+        state = _BatchingState(loop)
+        _BATCHING_STATE.value = state
+    return state
 
 
 def _get_audio(extra_info: dict) -> tuple[torch.Tensor, int]:
@@ -95,22 +110,23 @@ def _score_batch(requests) -> list[tuple[float, int] | Exception]:
 
     for (model_name_or_path, device), group in grouped_requests.items():
         try:
+            # Loop-local consumers may run in different threads, so cached model access must remain serialized.
             with _MODEL_LOCK:
                 model, processor = _load_clap(model_name_or_path, device)
-            inputs = processor(
-                text=[prompt for _, prompt, _, _ in group],
-                audio=[waveform for _, _, waveform, _ in group],
-                sampling_rate=_CLAP_SAMPLE_RATE,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-            )
-            inputs = {key: value.to(device) for key, value in inputs.items()}
-            with torch.no_grad():
-                outputs = model(**inputs)
-                audio_embedding = F.normalize(outputs.audio_embeds, p=2, dim=-1)
-                text_embedding = F.normalize(outputs.text_embeds, p=2, dim=-1)
-                scores = (audio_embedding * text_embedding).sum(dim=-1).float().tolist()
+                inputs = processor(
+                    text=[prompt for _, prompt, _, _ in group],
+                    audio=[waveform for _, _, waveform, _ in group],
+                    sampling_rate=_CLAP_SAMPLE_RATE,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                )
+                inputs = {key: value.to(device) for key, value in inputs.items()}
+                with torch.no_grad():
+                    outputs = model(**inputs)
+                    audio_embedding = F.normalize(outputs.audio_embeds, p=2, dim=-1)
+                    text_embedding = F.normalize(outputs.text_embeds, p=2, dim=-1)
+                    scores = (audio_embedding * text_embedding).sum(dim=-1).float().tolist()
             for (index, _, _, source_rate), score in zip(group, scores, strict=True):
                 results[index] = (score, source_rate)
         except Exception as e:
@@ -120,47 +136,78 @@ def _score_batch(requests) -> list[tuple[float, int] | Exception]:
     return results
 
 
-async def _consumer_loop():
-    loop = asyncio.get_running_loop()
+def _fail_requests(requests, error: Exception) -> None:
+    for *_, future in requests:
+        if not future.done():
+            future.set_exception(error)
+
+
+def _drain_failed_requests(state: _BatchingState, error: Exception) -> None:
+    requests = []
     while True:
-        request = await _score_queue.get()
-        if request[0] is None:
+        try:
+            request = state.queue.get_nowait()
+        except asyncio.QueueEmpty:
             break
-
-        requests = [request]
-        should_stop = False
-        await asyncio.sleep(0)
-        while len(requests) < _MAX_BATCH_SIZE:
-            try:
-                request = _score_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if request[0] is None:
-                should_stop = True
-                break
+        if request[0] is not None:
             requests.append(request)
-
-        results = await loop.run_in_executor(None, _score_batch, requests)
-        for (*_, future), result in zip(requests, results, strict=True):
-            if future.done():
-                continue
-            if isinstance(result, Exception):
-                logger.error("CLAP inference failed", exc_info=(type(result), result, result.__traceback__))
-                future.set_exception(result)
-            else:
-                future.set_result(result)
-
-        if should_stop:
-            break
+    _fail_requests(requests, error)
 
 
-async def _ensure_consumer():
-    global _consumer_task
-    if _consumer_task is not None and not _consumer_task.done():
+async def _consumer_loop(state: _BatchingState):
+    loop = asyncio.get_running_loop()
+    requests = []
+    try:
+        while True:
+            request = await state.queue.get()
+            if request[0] is None:
+                break
+
+            requests = [request]
+            should_stop = False
+            await asyncio.sleep(0)
+            while len(requests) < _MAX_BATCH_SIZE:
+                try:
+                    request = state.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if request[0] is None:
+                    should_stop = True
+                    break
+                requests.append(request)
+
+            results = await loop.run_in_executor(None, _score_batch, requests)
+            for (*_, future), result in zip(requests, results, strict=True):
+                if future.done():
+                    continue
+                if isinstance(result, Exception):
+                    logger.error("CLAP inference failed", exc_info=(type(result), result, result.__traceback__))
+                    future.set_exception(result)
+                else:
+                    future.set_result(result)
+            requests = []
+
+            if should_stop:
+                break
+    except asyncio.CancelledError:
+        error = RuntimeError("CLAP batch consumer was cancelled before completing inference.")
+        _fail_requests(requests, error)
+        _drain_failed_requests(state, error)
+        raise
+    except BaseException as error:
+        if not isinstance(error, Exception):
+            error = RuntimeError(f"CLAP batch consumer stopped unexpectedly: {type(error).__name__}")
+        _fail_requests(requests, error)
+        _drain_failed_requests(state, error)
+        raise
+
+
+async def _ensure_consumer(state: _BatchingState):
+    if state.consumer_task is not None and not state.consumer_task.done():
         return
-    async with _consumer_lock:
-        if _consumer_task is None or _consumer_task.done():
-            _consumer_task = asyncio.create_task(_consumer_loop())
+    async with state.consumer_lock:
+        if state.consumer_task is None or state.consumer_task.done():
+            state.consumer_task = asyncio.create_task(_consumer_loop(state))
 
 
 async def compute_score(
@@ -175,10 +222,12 @@ async def compute_score(
     """Compute cosine similarity between generated audio and its text prompt."""
     del data_source, solution_image, kwargs
     device = device or get_device_name()
-    await _ensure_consumer()
 
     loop = asyncio.get_running_loop()
+    state = _get_batching_state()
     future = loop.create_future()
-    await _score_queue.put((ground_truth or "", extra_info, model_name_or_path, device, future))
+    await _ensure_consumer(state)
+    await state.queue.put((ground_truth or "", extra_info, model_name_or_path, device, future))
+    await _ensure_consumer(state)
     score, source_rate = await future
     return {"score": score, "source_sample_rate": source_rate}
