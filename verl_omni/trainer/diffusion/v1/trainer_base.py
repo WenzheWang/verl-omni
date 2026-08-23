@@ -61,7 +61,7 @@ from verl_omni.trainer.diffusion.diffusion_metric_utils import (
     compute_throughput_metrics_diffusion,
     compute_timing_metrics_diffusion,
 )
-from verl_omni.trainer.diffusion.ray_diffusion_trainer import compute_advantage
+from verl_omni.trainer.diffusion.ray_diffusion_trainer import _to_diffusion_worker_tensordict, compute_advantage
 from verl_omni.trainer.diffusion.rollout_correction import (
     apply_bypass_mode_to_diffusion_batch,
     apply_rollout_correction_to_diffusion_batch,
@@ -819,7 +819,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
     def _compute_old_log_prob(self, data: DataProto) -> DataProto:
         """Recompute old log-probs over diffusion latents with the actor engine."""
-        batch_td = data.to_tensordict()
+        batch_td = _to_diffusion_worker_tensordict(data)
         batch_td = embeds_padding_2_no_padding(batch_td)
         tu.assign_non_tensor(
             batch_td,
@@ -838,7 +838,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
     def _compute_ref_log_prob(self, data: DataProto) -> DataProto:
         """Compute reference log-probs over diffusion latents."""
-        batch_td = data.to_tensordict()
+        batch_td = _to_diffusion_worker_tensordict(data)
         batch_td = embeds_padding_2_no_padding(batch_td)
         metadata = {
             "compute_loss": False,
@@ -884,7 +884,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         """Update the diffusion actor network."""
         rollout_config = self.config.actor_rollout_ref.rollout
         data.meta_info["multi_turn"] = rollout_config.multi_turn.enable
-        batch_td = data.to_tensordict()
+        batch_td = _to_diffusion_worker_tensordict(data)
         batch_td = embeds_padding_2_no_padding(batch_td)
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n

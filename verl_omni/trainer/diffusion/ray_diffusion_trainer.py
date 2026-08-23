@@ -83,6 +83,13 @@ from verl_omni.workers.utils.padding import embeds_padding_2_no_padding
 sys_logger = logging.getLogger(__name__)
 
 
+def _to_diffusion_worker_tensordict(batch: DataProto):
+    """Project a driver batch for actor/ref workers without copying tensor storage."""
+    worker_batch = batch.to_tensordict()
+    worker_batch.pop("responses", None)
+    return worker_batch
+
+
 def compute_advantage(
     data: DataProto,
     adv_estimator: str,
@@ -928,7 +935,7 @@ class BaseRayDiffusionTrainer(ABC):
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # update actor
-        batch_td = batch.to_tensordict()
+        batch_td = _to_diffusion_worker_tensordict(batch)
         # step 2: convert from padding to no-padding
         batch_td = embeds_padding_2_no_padding(batch_td)
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
@@ -1006,7 +1013,7 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
     """Policy-gradient diffusion trainer for FlowGRPO, MixGRPO, DanceGRPO, GRPO-Guard, etc."""
 
     def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
-        batch_td = batch.to_tensordict()
+        batch_td = _to_diffusion_worker_tensordict(batch)
         batch_td = embeds_padding_2_no_padding(batch_td)
         metadata = {
             "compute_loss": False,
@@ -1030,7 +1037,7 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
         return DataProto.from_tensordict(ref_log_prob)
 
     def _compute_teacher_prev_sample_mean(self, batch: DataProto) -> DataProto:
-        batch_td = batch.to_tensordict()
+        batch_td = _to_diffusion_worker_tensordict(batch)
         batch_td = embeds_padding_2_no_padding(batch_td)
         tu.assign_non_tensor(
             batch_td,
@@ -1045,7 +1052,7 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
         return DataProto.from_tensordict(teacher_output)
 
     def _compute_old_log_prob(self, batch: DataProto) -> tuple[DataProto, Optional[float]]:
-        batch_td = batch.to_tensordict()
+        batch_td = _to_diffusion_worker_tensordict(batch)
         batch_td = embeds_padding_2_no_padding(batch_td)
         tu.assign_non_tensor(
             batch_td,
@@ -1412,7 +1419,7 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
-        batch_td = batch.to_tensordict()
+        batch_td = _to_diffusion_worker_tensordict(batch)
         batch_td = embeds_padding_2_no_padding(batch_td)
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         paired = self.config.algorithm.get("paired_preference", False)
@@ -1451,7 +1458,7 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
 
     def _compute_ref_noise_pred(self, batch: DataProto) -> Optional[DataProto]:
         """Reference transformer output and shared flow tensors."""
-        batch_td = batch.to_tensordict()
+        batch_td = _to_diffusion_worker_tensordict(batch)
         batch_td = embeds_padding_2_no_padding(batch_td)
         metadata = {
             "compute_loss": False,
