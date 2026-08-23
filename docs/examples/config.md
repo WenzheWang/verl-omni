@@ -1,6 +1,6 @@
 # Config Explanation
 
-Last updated: 07/30/2026
+Last updated: 08/23/2026
 
 VeRL-Omni builds on [verl](https://github.com/verl-project/verl) and reuses the
 same Hydra config surface for shared RL trainer fields (`data`, FSDP actor /
@@ -336,7 +336,7 @@ actor_rollout_ref:
 - `actor_rollout_ref.model.override_config`: Dict merged into HF config load (e.g. `attn_implementation`).
 - `actor_rollout_ref.model.enable_activation_offload` / `use_remove_padding`: Memory / packing flags for the FSDP actor.
 - `actor_rollout_ref.model.lora_*` / `target_modules` / `policy_state_adapters` / `fsdp_layer_prefixes`: Same LoRA roles as diffusion (defaults differ slightly, e.g. `lora_alpha: 16`).
-- `actor_rollout_ref.model.use_liger` / `use_fused_kernels` / `fused_kernel_options` / `tiled_mlp`: Optional kernel / memory optimizations.
+- `actor_rollout_ref.model.use_liger` / `use_fused_kernels`: Unsupported by omni FSDP/FSDP2 and must remain `false`; enabling either fails before model loading. The adjacent `fused_kernel_options` / `tiled_mlp` fields are backend-specific.
 - `actor_rollout_ref.model.max_image_tokens` / `max_audio_tokens` / `max_video_tokens`: Multimodal token budgets (`null` = unset).
 - `actor_rollout_ref.model.lora` / `mtp`: Megatron-style LoRA block and multi-token prediction (speculative decoding) configs; see the YAML comments in `omni/model/omni_model.yaml`.
 
