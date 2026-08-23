@@ -93,6 +93,30 @@ async def _stop_consumer(state):
     await state.consumer_task
 
 
+@pytest.mark.parametrize("active_request", [False, True])
+@pytest.mark.asyncio
+async def test_graceful_stop_settles_requests_queued_after_sentinel(monkeypatch, active_request):
+    state = _reset_consumer(monkeypatch)
+    loop = asyncio.get_running_loop()
+    active_future = loop.create_future()
+    trailing_future = loop.create_future()
+    request = ("right", {}, "model", "cpu", active_future)
+
+    monkeypatch.setattr(clap, "_score_batch", lambda requests: [(1.0, 48_000)] * len(requests))
+    if active_request:
+        state.queue.put_nowait(request)
+    state.queue.put_nowait((None, None, None, None, None))
+    state.queue.put_nowait(("up", {}, "model", "cpu", trailing_future))
+
+    await clap._consumer_loop(state)
+
+    if active_request:
+        assert await active_future == (1.0, 48_000)
+    with pytest.raises(RuntimeError, match="stopped before completing inference"):
+        await trailing_future
+    assert state.queue.empty()
+
+
 def _score(prompt, waveform, sample_rate=48_000, **kwargs):
     return clap.compute_score(
         data_source="test",

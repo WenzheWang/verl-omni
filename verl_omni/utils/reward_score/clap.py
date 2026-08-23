@@ -157,10 +157,12 @@ def _drain_failed_requests(state: _BatchingState, error: Exception) -> None:
 async def _consumer_loop(state: _BatchingState):
     loop = asyncio.get_running_loop()
     requests = []
+    stop_error = RuntimeError("CLAP batch consumer stopped before completing inference.")
     try:
         while True:
             request = await state.queue.get()
             if request[0] is None:
+                _drain_failed_requests(state, stop_error)
                 break
 
             requests = [request]
@@ -188,6 +190,7 @@ async def _consumer_loop(state: _BatchingState):
             requests = []
 
             if should_stop:
+                _drain_failed_requests(state, stop_error)
                 break
     except asyncio.CancelledError:
         error = RuntimeError("CLAP batch consumer was cancelled before completing inference.")
