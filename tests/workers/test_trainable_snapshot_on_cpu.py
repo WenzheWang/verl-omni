@@ -31,8 +31,11 @@ class _ShardParameter(torch.nn.Parameter):
         return self.detach()
 
 
-@pytest.fixture
-def worker(monkeypatch):
+@pytest.fixture(
+    params=("QwenImagePipeline", "StableDiffusion3Pipeline", "OtherPipeline", None),
+    ids=("qwen-image", "stable-diffusion-3", "other", "architecture-absent"),
+)
+def worker(monkeypatch, request):
     monkeypatch.setattr(snapshots, "DTensor", _ShardParameter)
     monkeypatch.setattr(snapshots, "get_device_name", lambda: "cpu")
     model = torch.nn.Module()
@@ -60,12 +63,16 @@ def worker(monkeypatch):
 
     instance = object.__new__(snapshots.DiffusionDetachActorWorker)
     instance.config = OmegaConf.create({"actor": {"strategy": "fsdp2"}})
+    model_config = {
+        "lora_rank": 2,
+        "policy_state_adapters": ("default",),
+    }
+    if request.param is not None:
+        model_config["architecture"] = request.param
     instance.actor = SimpleNamespace(
         engine=SimpleNamespace(
             module=model,
-            model_config=SimpleNamespace(
-                architecture="QwenImagePipeline", lora_rank=2, policy_state_adapters=("default",)
-            ),
+            model_config=SimpleNamespace(**model_config),
             engine_config=FSDPEngineConfig(strategy="fsdp2", ulysses_sequence_parallel_size=1),
             is_param_offload_enabled=False,
             _uses_fsdp2_cpu_offload_policy=False,
@@ -118,7 +125,6 @@ def test_snapshot_is_trainable_only_independent_and_preserves_parameter_identity
     [
         "fsdp",
         "veomni",
-        "architecture",
         "no_lora",
         "multi_adapter",
         "module_adapter",
@@ -134,8 +140,6 @@ def test_unsupported_combinations_keep_full_snapshot(worker, unsupported):
     model = engine.module
     if unsupported in ("fsdp", "veomni"):
         worker.config.actor.strategy = unsupported
-    elif unsupported == "architecture":
-        engine.model_config.architecture = "OtherPipeline"
     elif unsupported == "no_lora":
         engine.model_config.lora_rank = 0
     elif unsupported == "multi_adapter":

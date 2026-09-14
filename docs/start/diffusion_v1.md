@@ -150,19 +150,20 @@ bash examples/flowgrpo_trainer/sd35/run_sd35_medium_ocr_lora_v1_separate_async.s
 requires `num_warmup_batches=0`; set it to `false` to retain rollout/training
 overlap.
 
-### Qwen-Image LoRA policy snapshots
+### Model-agnostic LoRA policy snapshots
 
-For Qwen-Image (`QwenImagePipeline`) with FSDP2, a single `default` LoRA
-adapter and sequence parallel size 1, separate-async CPU snapshots retain only
-the trainable parameters. This includes any trainable parameters outside the
-LoRA layers. The cycle-start `π_old` and current-actor restoration semantics
-are unchanged; no new configuration is required.
+With FSDP2, a single `default` LoRA adapter, and sequence parallel size 1,
+separate-async CPU snapshots retain only the trainable parameters regardless of
+model architecture. This includes any trainable parameters outside the LoRA
+layers. The cycle-start `π_old` and current-actor restoration semantics are
+unchanged; no new configuration is required.
 
 This reduces the snapshot payload, not the cost of materializing the actor
-when manual parameter offload is enabled. FSDP1, other models/backends,
-multiple policy adapters, native FSDP2 CPU offload policy, and full-parameter
-training retain full snapshots. Changing the trainable parameter set or shard
-layout within a snapshot's lifetime is unsupported and fails before restore.
+when manual parameter offload is enabled. FSDP1 and other backends, multiple
+policy adapters, native FSDP2 CPU offload policy, and full-parameter training
+retain full snapshots. Changing the trainable parameter set or shard layout
+within a snapshot's lifetime is unsupported and fails before restore. Qwen-Image
+is only the benchmark fixture below, not an eligibility requirement.
 
 To measure snapshot overhead with a locally available pretrained Qwen-Image
 checkpoint, run the standalone benchmark outside fast CI:

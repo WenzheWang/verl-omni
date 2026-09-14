@@ -95,7 +95,6 @@ class DiffusionDetachActorWorker(ActorRolloutRefWorker, DetachActorWorker):
         engine_config = getattr(engine, "engine_config", None)
         return (
             self.config.actor.strategy == "fsdp2"
-            and getattr(model_config, "architecture", None) == "QwenImagePipeline"
             and getattr(model_config, "lora_rank", 0) > 0
             and tuple(getattr(model_config, "policy_state_adapters", ())) == ("default",)
             and getattr(engine_config, "ulysses_sequence_parallel_size", None) == 1
