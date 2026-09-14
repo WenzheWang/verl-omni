@@ -241,10 +241,8 @@ python tests/special_e2e/build_qwen_image_edit_plus_tiny_random.py \
     --output-dir ~/models/tiny-random/qwen-image-edit-plus
 ```
 
-The builder copies tokenizer, processor, and scheduler assets from the locally
-cached `Qwen/Qwen-Image-Edit-2511` snapshot without loading its weight shards.
-Use `--source-model <local-path>` if those assets are stored elsewhere. The
-builder does not download missing source assets.
+The builder creates the random weights, tokenizer, processor, and scheduler
+locally and does not require network access or a cached source checkpoint.
 
 Set `MODEL_PATH` on the smoke-test command to use another compatible tiny
 checkpoint. A successful run ends with:
