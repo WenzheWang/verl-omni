@@ -69,7 +69,7 @@ jobs:
           pip install --no-deps "verl @ git+https://github.com/verl-project/verl.git@$(cat .github/verl_pin.txt)"
           pip install ".[omni,dev]"
           pip install --no-deps \
-            "qwen-tts @ git+https://github.com/QwenLM/Qwen3-TTS.git@$(cat .github/qwen_tts_pin.txt)"
+            "qwen-tts @ https://github.com/QwenLM/Qwen3-TTS/archive/$(cat .github/qwen_tts_pin.txt).tar.gz"
           pip install --no-deps -e .
       - name: Verify the documented train install resolves
         run: |

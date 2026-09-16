@@ -46,6 +46,7 @@ examples/config.md
 :caption: Advanced Features
 
 algo/async_reward.md
+algo/named_reward_models.md
 algo/rollout_correction.md
 algo/separate_async_omni.md
 start/rollout_batching.md
@@ -100,6 +101,7 @@ examples/minimax_h3/flowgrpo_trainer_minimax_h3.md
 :maxdepth: 1
 :caption: Performance Tuning Guide
 
+perf/tuning_guide.md
 perf/diffusion_mfu.md
 perf/profiler.md
 ```

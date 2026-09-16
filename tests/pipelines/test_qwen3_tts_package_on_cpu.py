@@ -16,6 +16,7 @@
 import importlib.util
 import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 import pytest
@@ -68,7 +69,7 @@ def test_smoke_tiny_model_mrope_section_matches_head_dimension():
     assert sum(section) == 64 // 2
 
 
-def test_qwen_tts_registers_and_runs_without_a_transformers_compatibility_layer(tmp_path, monkeypatch):
+def test_qwen_tts_registers_and_runs_without_a_transformers_compatibility_layer(monkeypatch):
     transformers = pytest.importorskip("transformers")
     if importlib.util.find_spec("qwen_tts") is None:
         pytest.skip("qwen-tts is an optional dependency")
@@ -136,6 +137,7 @@ def test_qwen_tts_registers_and_runs_without_a_transformers_compatibility_layer(
         tts_bos_token_id=61,
         tts_eos_token_id=62,
     )
+    config.speaker_encoder_config.dtype = torch.float32
     model = Qwen3TTSForConditionalGeneration(config)
     output = model.talker(
         inputs_embeds=torch.randn(2, 5, 8),
@@ -169,17 +171,20 @@ def test_qwen_tts_registers_and_runs_without_a_transformers_compatibility_layer(
 
     from verl_omni.pipelines.qwen3_tts.talker_training_adapter import Qwen3TTSTalkerAdapter
 
-    speaker_path = tmp_path / "speaker.json"
-    speaker_path.write_text(json.dumps([0.0] * 8), encoding="utf-8")
-    configured = Qwen3TTSTalkerAdapter.configure_model(
-        model,
-        SimpleNamespace(
-            use_remove_padding=False,
-            override_config={"tts_spk_embed_path": str(speaker_path), "tts_language": "Auto"},
-        ),
-    )
-    trainable_names = {name for name, parameter in configured.named_parameters() if parameter.requires_grad}
-    assert trainable_names
-    assert all(name.startswith(("talker.model.", "talker.codec_head.")) for name in trainable_names)
-    assert any(not parameter.requires_grad for parameter in configured.parameters())
-    assert configured.get_input_embeddings() is configured.talker.model.codec_embedding
+    with TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        speaker_path = temp_path / "speaker.json"
+        speaker_path.write_text(json.dumps([0.0] * 8), encoding="utf-8")
+        configured = Qwen3TTSTalkerAdapter.configure_model(
+            model,
+            SimpleNamespace(
+                use_remove_padding=False,
+                override_config={"tts_spk_embed_path": str(speaker_path), "tts_language": "Auto"},
+            ),
+        )
+        trainable_names = {name for name, parameter in configured.named_parameters() if parameter.requires_grad}
+        assert trainable_names
+        assert all(name.startswith(("talker.model.", "talker.codec_head.")) for name in trainable_names)
+        assert any(not parameter.requires_grad for parameter in configured.parameters())
+        assert configured.get_input_embeddings() is configured.talker.model.codec_embedding
+        configured.config.save_pretrained(temp_path / "checkpoint_config")
