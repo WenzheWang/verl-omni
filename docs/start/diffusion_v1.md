@@ -1,6 +1,6 @@
 # Diffusion V1 training
 
-Last updated: 09/16/2026
+Last updated: 09/17/2026
 
 This guide runs the diffusion V1 trainer in synchronous or separate-asynchronous
 mode using the provided Stable Diffusion 3.5 Medium FlowGRPO OCR recipes.
@@ -164,6 +164,14 @@ policy adapters, native FSDP2 CPU offload policy, and full-parameter training
 retain full snapshots. Changing the trainable parameter set or shard layout
 within a snapshot's lifetime is unsupported and fails before restore. Qwen-Image
 is only the benchmark fixture below, not an eligibility requirement.
+
+For steady-state, unmerged LoRA weight synchronization with manual actor
+parameter offload, the actor first gathers independent CPU adapter tensors and
+offloads parameters and runs synchronized cache cleanup before waking rollout weights.
+This avoids overlapping actor and colocated rollout weight residency. It trades
+gather/wakeup overlap for GPU memory headroom; it does not change snapshot
+contents or guarantee that every model/configuration fits. First base sync,
+merged LoRA and non-offloaded paths retain their existing synchronization order.
 
 To measure snapshot overhead with a locally available pretrained Qwen-Image
 checkpoint, run the standalone benchmark outside fast CI:
