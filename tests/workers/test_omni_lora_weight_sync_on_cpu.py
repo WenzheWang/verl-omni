@@ -66,12 +66,18 @@ def _fast_path_worker(rollout_rank=0):
 
 
 def _run_update(worker, **kwargs):
+    # This regression test covers weight-version stamping, not background thread scheduling.
+    async def run_in_event_loop(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
     sender = MagicMock()
     sender.async_send_weights = AsyncMock()
     with (
         patch.object(ew, "BucketedWeightSender", return_value=sender),
+        patch.object(ew.asyncio, "to_thread", run_in_event_loop),
         patch.object(ew, "log_gpu_memory_usage", MagicMock()),
         patch.object(ew, "set_expandable_segments", MagicMock()),
+        patch.object(ew, "get_torch_device", return_value=MagicMock(current_device=MagicMock(return_value=0))),
     ):
         asyncio.run(ew.ActorRolloutRefWorker.update_weights(worker, mode="naive", **kwargs))
     return sender

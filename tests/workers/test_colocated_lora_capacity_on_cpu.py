@@ -18,6 +18,7 @@ The one-unit budget represents an actor or resumed rollout weight allocation.
 """
 
 import asyncio
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -90,7 +91,7 @@ def _worker(*, offload=True, free_cache=True, lora=True, base_synced=True, merge
     return worker, events, adapter, peft_config
 
 
-def _run(worker, events, *, mode="naive", global_steps=7, fail_send=False):
+def _run(worker, events, *, mode="naive", global_steps=7, fail_send=False, device=None):
     sender = MagicMock()
     sent = []
 
@@ -114,14 +115,27 @@ def _run(worker, events, *, mode="naive", global_steps=7, fail_send=False):
         patch.object(ew, "BucketedWeightSender", return_value=sender),
         patch.object(ew, "log_gpu_memory_usage"),
         patch.object(ew, "set_expandable_segments"),
-        patch.object(ew, "aggressive_empty_cache", side_effect=lambda **kwargs: events.append(("empty_cache", kwargs))),
+        patch.object(ew, "get_torch_device", return_value=device or _device(events)),
     ):
         asyncio.run(invoke())
     return sender, sent
 
 
+def _device(events):
+    device = MagicMock()
+    device.current_device.return_value = 0
+    device.synchronize.side_effect = lambda: events.append(("synchronize",))
+    device.empty_cache.side_effect = lambda: events.append(("empty_cache",))
+    return device
+
+
 def _names(events):
     return [event[0] for event in events]
+
+
+async def _wait_for_thread_event(event):
+    while not event.is_set():
+        await asyncio.sleep(0.001)
 
 
 @pytest.mark.parametrize("free_cache", [True, False])
@@ -133,13 +147,14 @@ def test_offloaded_lora_releases_actor_before_rollout_and_forwards_exact_adapter
     assert (
         names.index("gather")
         < names.index("offload")
+        < names.index("synchronize")
         < names.index("empty_cache")
         < names.index("execute")
         < names.index("send")
     )
     assert names.count("offload") == 1
     assert names.count("empty_cache") == 1
-    assert events[names.index("empty_cache")] == ("empty_cache", {"force_sync": True})
+    assert events[names.index("empty_cache")] == ("empty_cache",)
     if free_cache:
         assert names.index("empty_cache") < names.index("resume") < names.index("execute")
         assert events[-1] == ("resume", ("kv_cache",))
@@ -170,6 +185,8 @@ def test_offloaded_lora_failure_stops_later_stages(failure):
     worker.rollout.server_handle.clear_kv_cache.remote.assert_not_awaited()
     if failure in ("gather", "offload"):
         worker.rollout.resume.assert_not_awaited()
+    if failure == "gather":
+        assert _names(events).count("offload") == 1
 
 
 def test_offloaded_lora_ipc_failure_does_not_resume_kv_cache():
@@ -179,6 +196,117 @@ def test_offloaded_lora_ipc_failure_does_not_resume_kv_cache():
 
     assert [event for event in events if event[0] == "resume"] == [("resume", ("weights",))]
     worker.rollout.server_handle.clear_kv_cache.remote.assert_not_awaited()
+
+
+def test_offloaded_lora_worker_uses_callers_device():
+    worker, events, _, _ = _worker()
+    device_local = threading.local()
+    device_local.index = 3
+    device = _device(events)
+    device.current_device.side_effect = lambda: getattr(device_local, "index", None)
+    device.set_device.side_effect = lambda index: setattr(device_local, "index", index)
+    gather = worker.actor.engine.get_per_tensor_param.side_effect
+
+    def check_device(**kwargs):
+        assert threading.current_thread() is not threading.main_thread()
+        assert device_local.index == 3
+        return gather(**kwargs)
+
+    worker.actor.engine.get_per_tensor_param.side_effect = check_device
+    _run(worker, events, device=device)
+
+    device.set_device.assert_called_once_with(3)
+    assert _names(events).index("gather") < _names(events).index("offload")
+
+
+@pytest.mark.parametrize("blocked_stage", ["gather", "offload"])
+def test_offloaded_lora_blocking_work_keeps_event_loop_responsive(blocked_stage):
+    worker, events, _, _ = _worker()
+    entered = threading.Event()
+    release = threading.Event()
+    target = worker.actor.engine.get_per_tensor_param if blocked_stage == "gather" else worker.actor.engine.to
+    original = target.side_effect
+
+    def blocked(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original(*args, **kwargs)
+
+    target.side_effect = blocked
+
+    async def drive():
+        task = asyncio.create_task(ew.ActorRolloutRefWorker.update_weights(worker, mode="naive", global_steps=7))
+        try:
+            await asyncio.wait_for(_wait_for_thread_event(entered), timeout=2)
+            heartbeat = asyncio.Event()
+            asyncio.get_running_loop().call_soon(heartbeat.set)
+            await asyncio.wait_for(heartbeat.wait(), timeout=1)
+            assert not task.done()
+        finally:
+            release.set()
+        await task
+        assert asyncio.all_tasks() == {asyncio.current_task()}
+
+    with (
+        patch.object(ew, "BucketedWeightSender") as sender_type,
+        patch.object(ew, "log_gpu_memory_usage"),
+        patch.object(ew, "set_expandable_segments"),
+        patch.object(ew, "get_torch_device", return_value=_device(events)),
+    ):
+        sender_type.return_value.async_send_weights = AsyncMock()
+        asyncio.run(drive())
+
+    assert _names(events).index("offload") < _names(events).index("resume")
+    worker.rollout._execute_method.assert_awaited_once()
+
+
+@pytest.mark.parametrize("blocked_stage", ["gather", "offload"])
+@pytest.mark.parametrize("worker_fails", [False, True])
+def test_offloaded_lora_cancellation_drains_repeatedly_cancelled_worker(blocked_stage, worker_fails):
+    worker, events, _, _ = _worker()
+    entered = threading.Event()
+    release = threading.Event()
+    target = worker.actor.engine.get_per_tensor_param if blocked_stage == "gather" else worker.actor.engine.to
+    original = target.side_effect
+
+    def blocked(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        if worker_fails:
+            raise RuntimeError(f"{blocked_stage} failed")
+        return original(*args, **kwargs)
+
+    target.side_effect = blocked
+
+    async def drive():
+        task = asyncio.create_task(ew.ActorRolloutRefWorker.update_weights(worker, mode="naive", global_steps=7))
+        try:
+            await asyncio.wait_for(_wait_for_thread_event(entered), timeout=2)
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        if worker_fails:
+            assert isinstance(caught.value.__cause__, RuntimeError)
+            assert str(caught.value.__cause__) == f"{blocked_stage} failed"
+        assert asyncio.all_tasks() == {asyncio.current_task()}
+
+    with (
+        patch.object(ew, "log_gpu_memory_usage"),
+        patch.object(ew, "set_expandable_segments"),
+        patch.object(ew, "get_torch_device", return_value=_device(events)),
+    ):
+        asyncio.run(drive())
+
+    if blocked_stage == "gather":
+        assert _names(events).count("offload") == 1
+    worker.rollout.resume.assert_not_awaited()
+    worker.rollout._execute_method.assert_not_awaited()
 
 
 @pytest.mark.parametrize("blocked_stage", ["resume", "send"])
@@ -214,7 +342,7 @@ def test_offloaded_lora_cancellation_has_no_owned_task_or_kv_resume(blocked_stag
         patch.object(ew, "BucketedWeightSender", return_value=sender),
         patch.object(ew, "log_gpu_memory_usage"),
         patch.object(ew, "set_expandable_segments"),
-        patch.object(ew, "aggressive_empty_cache"),
+        patch.object(ew, "get_torch_device", return_value=_device(events)),
     ):
         asyncio.run(drive())
 
@@ -232,6 +360,34 @@ def test_non_offloaded_lora_keeps_fast_ipc_path():
     assert worker.rollout.resume.await_count == 2
     worker.rollout.update_weights.assert_not_awaited()
     assert worker.base_sync_done is True
+
+
+def test_non_offloaded_lora_threads_use_callers_device():
+    worker, events, _, _ = _worker(offload=False)
+    device_local = threading.local()
+    device_local.index = 3
+    device = _device(events)
+    device.current_device.side_effect = lambda: getattr(device_local, "index", None)
+    device.set_device.side_effect = lambda index: setattr(device_local, "index", index)
+    gather = worker.actor.engine.get_per_tensor_param.side_effect
+
+    def check_gather(**kwargs):
+        assert threading.current_thread() is not threading.main_thread()
+        assert device_local.index == 3
+        return gather(**kwargs)
+
+    def check_offload():
+        assert threading.current_thread() is not threading.main_thread()
+        assert device_local.index == 3
+        events.append(("synchronize",))
+
+    worker.actor.engine.get_per_tensor_param.side_effect = check_gather
+    device.synchronize.side_effect = check_offload
+    _run(worker, events, device=device)
+
+    assert device.set_device.call_count == 2
+    assert all(call.args == (3,) for call in device.set_device.call_args_list)
+    assert _names(events).index("gather") < _names(events).index("synchronize")
 
 
 def test_non_naive_backend_is_unchanged():

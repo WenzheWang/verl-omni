@@ -24,7 +24,7 @@ from verl_omni.workers import detach_actor_worker as snapshots
 
 
 class _ShardParameter(torch.nn.Parameter):
-    device_mesh = "mesh"
+    device_mesh = SimpleNamespace(device_type="cpu", mesh=torch.tensor([0, 1]), mesh_dim_names=("fsdp",))
     placements = ("shard-0",)
 
     def to_local(self):
@@ -210,13 +210,15 @@ def test_remote_rank_ineligibility_uses_full_snapshot_on_every_rank(worker, monk
 
     def remote_ineligible(flag, op):
         assert op == torch.distributed.ReduceOp.MIN
-        assert flag.item() == 1
-        flag.fill_(0)
+        if flag.numel() == 2:
+            assert flag.tolist() == [1, 1]
+            flag[1] = 0
 
     monkeypatch.setattr(torch.distributed, "all_reduce", remote_ineligible)
     worker.save_model_to_cpu(0)
     assert not isinstance(worker.cpu_saved_models[0], snapshots._TrainableSnapshot)
     assert worker.test_calls == [tuple(id(param) for param in worker.actor.engine.module.parameters())]
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
     worker.restore_model_from_cpu(0)
 
 
@@ -227,14 +229,111 @@ def test_remote_rank_mapping_failure_is_collective(worker, monkeypatch):
         model.extra.add_(10)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
 
+    calls = []
+
     def remote_failure(flag, op):
-        assert op == torch.distributed.ReduceOp.MAX
-        flag.fill_(1)
+        assert op == torch.distributed.ReduceOp.MIN
+        calls.append(flag.tolist())
+        if len(calls) == 3:
+            flag.fill_(0)
 
     monkeypatch.setattr(torch.distributed, "all_reduce", remote_failure)
     with pytest.raises(RuntimeError, match="at least one actor rank"):
         worker.restore_model_from_cpu(0)
     torch.testing.assert_close(model.extra, torch.tensor([13.0]), rtol=0, atol=0)
+    assert len(calls) == 3
+
+
+def test_equivalent_mesh_recreation_is_accepted_and_signature_is_not_live(worker):
+    model = worker.actor.engine.module
+    model.adapter.device_mesh = SimpleNamespace(device_type="cpu", mesh=torch.tensor([0, 1]), mesh_dim_names=("fsdp",))
+    worker.save_model_to_cpu(0)
+    original = worker.cpu_saved_models[0].layouts
+    model.adapter.device_mesh.mesh[0] = 9
+    assert worker.cpu_saved_models[0].layouts == original
+    model.adapter.device_mesh = SimpleNamespace(device_type="cpu", mesh=torch.tensor([0, 1]), mesh_dim_names=("fsdp",))
+    worker.restore_model_from_cpu(0)
+    model.adapter.device_mesh.mesh = torch.tensor([1, 0])
+    with pytest.raises(RuntimeError, match="parameter mapping changed"):
+        worker.restore_model_from_cpu(0)
+
+
+@pytest.mark.parametrize("stage", ["eligibility", "enumeration", "layout", "aliases"])
+@pytest.mark.parametrize("operation", ["save", "restore"])
+def test_local_preparation_exception_still_participates(worker, monkeypatch, stage, operation):
+    worker.save_model_to_cpu(0)
+    model = worker.actor.engine.module
+    before = model.extra.detach().clone()
+    collectives = []
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda flag, op: collectives.append(flag.tolist()))
+
+    def fail(*args, **kwargs):
+        raise ValueError("injected preparation failure")
+
+    if stage == "eligibility":
+        monkeypatch.setattr(worker, "_supports_trainable_snapshot", fail)
+    elif stage == "enumeration":
+        monkeypatch.setattr(model, "named_parameters", fail)
+    elif stage == "layout":
+        monkeypatch.setattr(snapshots, "_parameter_layout", fail)
+    else:
+        monkeypatch.setattr(snapshots, "_trainable_aliases", fail)
+    old = worker.cpu_saved_models[0]
+    with pytest.raises(RuntimeError, match="at least one actor rank") as caught:
+        if operation == "save":
+            worker.save_model_to_cpu(0)
+        else:
+            worker.restore_model_from_cpu(0)
+    assert isinstance(caught.value.__cause__, ValueError)
+    assert collectives[-1][0] == 0
+    assert worker.cpu_saved_models[0] is old
+    torch.testing.assert_close(model.extra, before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("remote_flags, message", [([0, 0, 0], "Unknown"), ([1, 0, 0], "representation differs")])
+@pytest.mark.parametrize("strategy", ["fsdp2", "veomni", "fsdp"])
+def test_missing_or_mixed_remote_snapshot_rejected_before_materialization(
+    worker, monkeypatch, remote_flags, message, strategy
+):
+    worker.config.actor.strategy = strategy
+    worker.save_model_to_cpu(0)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+    def disagree(flag, op):
+        assert flag.numel() == 3
+        flag.copy_(torch.tensor(remote_flags))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", disagree)
+    with pytest.raises((KeyError, RuntimeError), match=message):
+        worker.restore_model_from_cpu(0)
+    assert worker.test_transitions == []
+
+
+@pytest.mark.parametrize("local_failure", [False, True])
+def test_clone_failure_preserves_previous_snapshot_on_every_rank(worker, monkeypatch, local_failure):
+    worker.save_model_to_cpu(0)
+    old = worker.cpu_saved_models[0]
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    calls = []
+
+    def capture(flag, op):
+        calls.append(flag.tolist())
+        if len(calls) == 3:
+            assert flag.tolist() == [int(not local_failure)]
+            flag.zero_()
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", capture)
+    if local_failure:
+
+        def fail(_state):
+            raise MemoryError("injected CPU clone failure")
+
+        monkeypatch.setattr(snapshots, "_clone_cpu_tensors", fail)
+    with pytest.raises(RuntimeError, match="CPU capture failed"):
+        worker.save_model_to_cpu(0)
+    assert worker.cpu_saved_models[0] is old
+    assert len(calls) == 3
 
 
 def test_snapshot_save_failure_does_not_publish_and_reoffloads(worker):

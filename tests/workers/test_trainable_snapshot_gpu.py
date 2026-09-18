@@ -13,19 +13,23 @@
 # limitations under the License.
 """Two-rank snapshot mechanism test, not pretrained precision or throughput evidence.
 
-Run: torchrun --standalone --nproc-per-node=2 tests/workers/test_trainable_snapshot_gpu.py --output /tmp/snapshots
+Run: pytest -s tests/workers/test_trainable_snapshot_gpu.py
 """
 
 import argparse
 import gc
 import json
 import os
+import subprocess
+import sys
 import time
+from datetime import timedelta
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 import torch.distributed as dist
 from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageTransformer2DModel
@@ -38,6 +42,7 @@ from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig
 
 from verl_omni.trainer.diffusion.v1.trainer_base import PolicyGradientDiffusionTrainerV1
 from verl_omni.trainer.diffusion.v1.trainer_separate_async import PolicyGradientDiffusionTrainerV1SeparateAsync
+from verl_omni.workers import detach_actor_worker as snapshots
 from verl_omni.workers.config import DiffusionActorConfig, DiffusionLossConfig, DiffusionModelConfig
 from verl_omni.workers.config.diffusion.rollout import DiffusionPipelineConfig, DiffusionRolloutAlgoConfig
 from verl_omni.workers.detach_actor_worker import DiffusionDetachActorWorker, _TrainableSnapshot
@@ -257,6 +262,57 @@ def _run_case(model_path, offload):
     worker.restore_model_from_cpu(1)
     _assert_equal(_state(engine), before)
     worker.clear_cpu_model(1)
+
+    # One rank throwing before the helper collective must fail on every rank,
+    # without publishing a new snapshot or changing any actor parameters.
+    for operation in ("save", "restore"):
+        worker.save_model_to_cpu(2)
+        old = worker.cpu_saved_models[2]
+        layout = snapshots._parameter_layout
+
+        def injected_layout(param, layout=layout):
+            if dist.get_rank() == 1:
+                raise ValueError("rank-local layout failure")
+            return layout(param)
+
+        with patch.object(snapshots, "_parameter_layout", injected_layout):
+            with pytest.raises(RuntimeError, match="at least one actor rank"):
+                if operation == "save":
+                    worker.save_model_to_cpu(2)
+                else:
+                    worker.restore_model_from_cpu(2)
+        assert worker.cpu_saved_models[2] is old
+        _assert_equal(_state(engine), before)
+        worker.clear_cpu_model(2)
+        dist.barrier()
+
+    worker.save_model_to_cpu(3)
+    if dist.get_rank() == 1:
+        worker.clear_cpu_model(3)
+    with pytest.raises(KeyError, match="Unknown actor CPU snapshot"):
+        worker.restore_model_from_cpu(3)
+    worker.clear_cpu_model(3)
+    worker.save_model_to_cpu(4)
+    if dist.get_rank() == 1:
+        worker.cpu_saved_models[4] = worker.cpu_saved_models[4].state
+    with pytest.raises(RuntimeError, match="representation differs"):
+        worker.restore_model_from_cpu(4)
+    worker.clear_cpu_model(4)
+    worker.save_model_to_cpu(5)
+    previous = worker.cpu_saved_models[5]
+    clone = snapshots._clone_cpu_tensors
+
+    def injected_clone(state):
+        if dist.get_rank() == 1:
+            raise MemoryError("rank-local CPU clone failure")
+        return clone(state)
+
+    with patch.object(snapshots, "_clone_cpu_tensors", injected_clone):
+        with pytest.raises(RuntimeError, match="CPU capture failed"):
+            worker.save_model_to_cpu(5)
+    assert worker.cpu_saved_models[5] is previous
+    worker.clear_cpu_model(5)
+    _assert_equal(_state(engine), before)
     baseline.clear_cpu_model(900)
     report["verdict"] = "passed"
     del worker, trainer, baseline, histories
@@ -265,13 +321,40 @@ def _run_case(model_path, offload):
     return report
 
 
+def test_trainable_snapshot_two_rank(tmp_path):
+    """Exercise real shard helpers through the same pytest entry used by core smoke."""
+    if torch.cuda.device_count() < 2:
+        if os.environ.get("REQUIRE_TRAINABLE_SNAPSHOT_GPU") == "1":
+            pytest.fail("Required FSDP2 snapshot smoke needs two visible CUDA GPUs")
+        pytest.skip("Real FSDP2 shards require two CUDA GPUs")
+    output = tmp_path / "snapshots"
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc-per-node=2",
+            __file__,
+            "--output",
+            str(output),
+        ],
+        check=True,
+    )
+    for rank in range(2):
+        report = json.loads((output / f"result-rank{rank}.json").read_text())
+        assert len(report["results"]) == 2
+        assert all(result["verdict"] == "passed" for result in report["results"])
+
+
 def main():
     """Exercise real FSDP2 shards with a tiny random Qwen-Image fixture."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    dist.init_process_group("nccl")
+    # Liveness bound for deliberately injected rank-local failures, not a workload time budget.
+    dist.init_process_group("nccl", timeout=timedelta(seconds=120))
     assert dist.get_world_size() == 2
     if dist.get_rank() == 0:
         args.output.mkdir(parents=True, exist_ok=False)

@@ -45,7 +45,14 @@ def _clone_cpu_tensors(value):
 def _parameter_layout(param: torch.nn.Parameter) -> tuple:
     layout = (param.shape, param.dtype)
     if isinstance(param, DTensor):
-        return (*layout, param.device_mesh, param.placements, param.to_local().shape)
+        mesh = param.device_mesh
+        mesh_layout = (
+            mesh.device_type,
+            tuple(mesh.mesh.shape),
+            tuple(mesh.mesh.flatten().tolist()),
+            mesh.mesh_dim_names,
+        )
+        return (*layout, mesh_layout, tuple(param.placements), param.to_local().shape)
     return layout
 
 
@@ -82,12 +89,27 @@ class DiffusionDetachActorWorker(ActorRolloutRefWorker, DetachActorWorker):
         engine = self.actor.engine
         should_restore_offload = engine.is_param_offload_enabled
         try:
-            if should_restore_offload:
-                engine.to(get_device_name(), model=True, optimizer=False, grad=False)
-            yield engine.module
+            error = None
+            try:
+                if should_restore_offload:
+                    engine.to(get_device_name(), model=True, optimizer=False, grad=False)
+                module = engine.module
+            except Exception as exc:
+                error = exc
+            if not self._snapshot_agreement(error is None)[0]:
+                raise RuntimeError("Actor snapshot materialization failed on at least one actor rank") from error
+            yield module
         finally:
             if should_restore_offload:
                 engine.to("cpu", model=True, optimizer=False, grad=False)
+
+    def _snapshot_agreement(self, *flags: bool) -> tuple[bool, ...]:
+        """Agree before helpers, including full-snapshot backends with internal collectives."""
+        if torch.distributed.is_initialized():
+            values = torch.tensor(flags, dtype=torch.int32, device=get_device_name())
+            torch.distributed.all_reduce(values, op=torch.distributed.ReduceOp.MIN)
+            return tuple(bool(value) for value in values.tolist())
+        return flags
 
     def _supports_trainable_snapshot(self, module: torch.nn.Module) -> bool:
         engine = self.actor.engine
@@ -103,69 +125,95 @@ class DiffusionDetachActorWorker(ActorRolloutRefWorker, DetachActorWorker):
         )
 
     def _restore_trainable_snapshot(self, module: torch.nn.Module, snapshot: _TrainableSnapshot) -> None:
-        trainable = {name: param for name, param in module.named_parameters() if param.requires_grad}
-        layouts = tuple(_parameter_layout(param) for param in trainable.values())
-        compatible = (
-            self._supports_trainable_snapshot(module)
-            and id(module) == snapshot.module_id
-            and tuple(trainable) == snapshot.names
-            and layouts == snapshot.layouts
-            and _trainable_aliases(module) == snapshot.aliases
-        )
-        if torch.distributed.is_initialized():
-            invalid = torch.tensor(int(not compatible), device=get_device_name())
-            torch.distributed.all_reduce(invalid, op=torch.distributed.ReduceOp.MAX)
-            compatible = invalid.item() == 0
-        if not compatible:
-            raise RuntimeError("Trainable snapshot parameter mapping changed on at least one actor rank")
+        error = None
+        compatible = False
+        try:
+            trainable = {name: param for name, param in module.named_parameters() if param.requires_grad}
+            layouts = tuple(_parameter_layout(param) for param in trainable.values())
+            compatible = (
+                self._supports_trainable_snapshot(module)
+                and id(module) == snapshot.module_id
+                and tuple(trainable) == snapshot.names
+                and layouts == snapshot.layouts
+                and _trainable_aliases(module) == snapshot.aliases
+            )
+            view = torch.nn.ParameterList(trainable.values())
+            cpu_sharded_state, global_spec = snapshot.state
+        except Exception as exc:
+            error = exc
+        if not self._snapshot_agreement(error is None and compatible)[0]:
+            raise RuntimeError("Trainable snapshot parameter mapping changed on at least one actor rank") from error
 
         # ParameterList retains the live Parameters; the upstream helper owns shard copies and synchronization.
-        view = torch.nn.ParameterList(trainable.values())
-        cpu_sharded_state, global_spec = snapshot.state
         self.restore_handler(view, cpu_sharded_state, global_spec)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_model_to_cpu(self, snapshot_id: int) -> None:
         """Save this rank's current actor parameter shard to CPU."""
         with self._actor_model_for_snapshot() as module:
-            trainable = {}
-            eligible = self._supports_trainable_snapshot(module)
-            if eligible:
-                params = dict(module.named_parameters())
-                trainable = {name: param for name, param in params.items() if param.requires_grad}
-                eligible = len(trainable) < len(params) and any(
-                    isinstance(param, DTensor) for param in trainable.values()
-                )
+            error = None
+            eligible = False
+            try:
+                eligible = self._supports_trainable_snapshot(module)
+                if eligible:
+                    params = dict(module.named_parameters())
+                    trainable = {name: param for name, param in params.items() if param.requires_grad}
+                    eligible = len(trainable) < len(params) and any(
+                        isinstance(param, DTensor) for param in trainable.values()
+                    )
+                if eligible:
+                    view = torch.nn.ParameterList(trainable.values())
+                    layouts = tuple(_parameter_layout(param) for param in trainable.values())
+                    aliases = _trainable_aliases(module)
+            except Exception as exc:
+                error = exc
             # Actor ranks share a strategy; agree on the representation before restore can dispatch collectives.
-            if self.config.actor.strategy == "fsdp2" and torch.distributed.is_initialized():
-                flag = torch.tensor(int(eligible), device=get_device_name())
-                torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
-                eligible = flag.item() == 1
-            if eligible:
-                view = torch.nn.ParameterList(trainable.values())
-                state = _clone_cpu_tensors(self.copy_handler(view))
-                self.cpu_saved_models[snapshot_id] = _TrainableSnapshot(
-                    module_id=id(module),
-                    names=tuple(trainable),
-                    layouts=tuple(_parameter_layout(param) for param in trainable.values()),
-                    aliases=_trainable_aliases(module),
-                    state=state,
-                )
-                return
-            self.cpu_saved_models[snapshot_id] = _clone_cpu_tensors(self.copy_handler(module))
+            prepared, eligible = self._snapshot_agreement(error is None, eligible)
+            if not prepared:
+                raise RuntimeError("Actor snapshot preparation failed on at least one actor rank") from error
+            # The helper owns its collectives. Once it returns, CPU allocation can
+            # still fail locally; no rank may publish/overwrite until all clones exist.
+            state = self.copy_handler(view if eligible else module)
+            error = None
+            try:
+                saved = _clone_cpu_tensors(state)
+                if eligible:
+                    saved = _TrainableSnapshot(
+                        module_id=id(module),
+                        names=tuple(trainable),
+                        layouts=layouts,
+                        aliases=aliases,
+                        state=saved,
+                    )
+            except Exception as exc:
+                error = exc
+            if not self._snapshot_agreement(error is None)[0]:
+                raise RuntimeError("Actor snapshot CPU capture failed on at least one actor rank") from error
+            self.cpu_saved_models[snapshot_id] = saved
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def restore_model_from_cpu(self, snapshot_id: int) -> None:
         """Restore this rank's actor parameter shard from a CPU snapshot."""
-        if snapshot_id not in self.cpu_saved_models:
+        present = snapshot_id in self.cpu_saved_models
+        saved_model = self.cpu_saved_models.get(snapshot_id)
+        trainable = isinstance(saved_model, _TrainableSnapshot)
+        present, all_trainable, all_full = self._snapshot_agreement(present, trainable, not trainable)
+        if not present:
             raise KeyError(f"Unknown actor CPU snapshot: {snapshot_id}")
+        if not (all_trainable or all_full):
+            raise RuntimeError("Actor snapshot representation differs across actor ranks")
 
-        saved_model = self.cpu_saved_models[snapshot_id]
         with self._actor_model_for_snapshot() as module:
             if isinstance(saved_model, _TrainableSnapshot):
                 self._restore_trainable_snapshot(module, saved_model)
             elif self.config.actor.strategy in ("fsdp2", "veomni"):
-                cpu_sharded_state, global_spec = saved_model
+                error = None
+                try:
+                    cpu_sharded_state, global_spec = saved_model
+                except Exception as exc:
+                    error = exc
+                if not self._snapshot_agreement(error is None)[0]:
+                    raise RuntimeError("Actor snapshot state is invalid on at least one actor rank") from error
                 self.restore_handler(module, cpu_sharded_state, global_spec)
             else:
                 self.restore_handler(module, saved_model)

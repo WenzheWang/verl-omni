@@ -34,7 +34,7 @@ from verl.single_controller.base.decorator import Dispatch, make_nd_compute_data
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_device_name, is_npu_available, set_expandable_segments
+from verl.utils.device import get_device_name, get_torch_device, is_npu_available, set_expandable_segments
 from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.import_utils import import_external_libs
@@ -897,6 +897,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
         tu.assign_non_tensor(data, enable_timestep_staging=self.config.actor.get("enable_timestep_staging", False))
+        tu.assign_non_tensor(
+            data,
+            use_no_sync_for_gradient_accumulation=self.config.actor.get("use_no_sync_for_gradient_accumulation", False),
+        )
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 
@@ -998,7 +1002,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         start = time.perf_counter()
         if self.actor.engine.is_param_offload_enabled:
             self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
-        aggressive_empty_cache(force_sync=True)
+        get_torch_device().synchronize()
+        get_torch_device().empty_cache()
         if timings is not None:
             timings["offload_actor_to_cpu"] = time.perf_counter() - start
 
@@ -1006,8 +1011,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         """Gather LoRA adapter params into a CPU dict, without offloading the actor.
 
         ``collect_lora_params`` materializes the LoRA tensors in independent
-        CPU allocations. The capacity-bound offload path calls this synchronously
-        before actor release; the non-offload path runs it in a worker thread.
+        CPU allocations. The capacity-bound path gathers and releases the actor
+        in one worker thread; the non-offload path also gathers in a worker thread.
         """
         gather_start = time.perf_counter()
         per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
@@ -1116,13 +1121,39 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         offload_task = None
         if use_lora_fast_path:
             self.rollout.sleep_level = 1
+            device_index = get_torch_device().current_device()
+
+            def run_on_caller_device(operation):
+                get_torch_device().set_device(device_index)
+                return operation(timings)
+
             if release_actor_before_resume:
-                # Keep these synchronous so neither operation can outlive this
-                # update on cancellation: CPU adapter snapshot, actor release,
-                # rollout wakeup, then IPC. This branch intentionally trades
-                # overlap for bounded colocated GPU occupancy.
-                lora_weights, peft_config = self._gather_lora_weights(timings)
-                self._offload_actor_and_empty_cache(timings)
+                # Gather and release belong to one thread, which must finish even
+                # if its awaiting coroutine is cancelled. A worker thread does not
+                # inherit the caller's current accelerator device.
+                def gather_then_offload(timings):
+                    try:
+                        return self._gather_lora_weights(timings)
+                    finally:
+                        self._offload_actor_and_empty_cache(timings)
+
+                gather_task = asyncio.create_task(asyncio.to_thread(run_on_caller_device, gather_then_offload))
+                try:
+                    lora_weights, peft_config = await asyncio.shield(gather_task)
+                except asyncio.CancelledError as cancelled:
+                    # Shielding keeps the thread alive; drain it before this RPC
+                    # exits, including when cancellation is requested again.
+                    while not gather_task.done():
+                        try:
+                            await asyncio.shield(gather_task)
+                        except asyncio.CancelledError:
+                            continue
+                        except Exception:
+                            break
+                    worker_error = gather_task.exception()
+                    if worker_error is not None:
+                        raise cancelled from worker_error
+                    raise
                 offloaded = True
                 log_gpu_memory_usage("After actor offload before resume weights", logger=logger)
                 if self.config.rollout.free_cache_engine:
@@ -1130,11 +1161,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             else:
                 # Preserve gather/resume and offload/IPC overlap when the actor
                 # does not offload parameters.
-                gather_task = asyncio.create_task(asyncio.to_thread(self._gather_lora_weights, timings))
+                gather_task = asyncio.create_task(asyncio.to_thread(run_on_caller_device, self._gather_lora_weights))
                 if resume_weights_task is not None:
                     await resume_weights_task
                 lora_weights, peft_config = await gather_task
-                offload_task = asyncio.create_task(asyncio.to_thread(self._offload_actor_and_empty_cache, timings))
+                offload_task = asyncio.create_task(
+                    asyncio.to_thread(run_on_caller_device, self._offload_actor_and_empty_cache)
+                )
             log_gpu_memory_usage("After resume weights", logger=logger)
 
             # Use ZMQ IPC to transfer LoRA weights, bypassing Ray serialization.
@@ -1215,6 +1248,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             await offload_task
         elif not offloaded:
             self._offload_actor_and_empty_cache(timings)
+        log_gpu_memory_usage("After offload model to cpu", logger=logger)
 
         # 5. resume kv_cache
         if self.config.rollout.free_cache_engine:
