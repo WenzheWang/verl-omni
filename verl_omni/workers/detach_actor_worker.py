@@ -62,6 +62,30 @@ def _trainable_aliases(module: torch.nn.Module) -> tuple[tuple[str, int], ...]:
     )
 
 
+@torch.no_grad()
+def _restore_local_shards(module: torch.nn.Module, state: dict, target_spec=None) -> None:
+    """Restore local shards without a barrier; the worker agrees on errors.
+
+    Adapted from https://github.com/verl-project/verl/blob/main/verl/utils/fsdp_utils.py.
+    """
+    if target_spec is not None:
+        mesh = next((param.device_mesh for param in module.parameters() if isinstance(param, DTensor)), None)
+        if mesh is None or mesh != target_spec.device_mesh:
+            raise RuntimeError("Actor snapshot device mesh changed")
+    for name, param in module.named_parameters():
+        if name not in state:
+            continue
+        tensor = state[name]
+        if target_spec is not None:
+            tensor, saved_spec = tensor
+            if isinstance(param, DTensor) and (saved_spec is None or saved_spec.placements != target_spec.placements):
+                raise RuntimeError("Actor snapshot shard placements changed")
+        local = param.to_local() if isinstance(param, DTensor) else param
+        if local.shape != tensor.shape:
+            raise RuntimeError("Actor snapshot local shard shape changed")
+        local.copy_(tensor.to(local.device))
+
+
 @dataclass
 class _TrainableSnapshot:
     """Rank-local payload and the parameter mapping required to restore it."""
@@ -82,6 +106,14 @@ class DiffusionDetachActorWorker(ActorRolloutRefWorker, DetachActorWorker):
         ActorRolloutRefWorker.__init__(self, config, role, distillation_config=distillation_config, **kwargs)
         self._strategy_handlers = None
         self.cpu_saved_models: dict[int, Any] = {}
+
+    def _get_strategy_handlers(self):
+        if self._strategy_handlers is None:
+            copy_handler, restore_handler = super()._get_strategy_handlers()
+            if self.config.actor.strategy in ("fsdp", "fsdp2", "veomni"):
+                restore_handler = _restore_local_shards
+            self._strategy_handlers = (copy_handler, restore_handler)
+        return self._strategy_handlers
 
     @contextmanager
     def _actor_model_for_snapshot(self) -> Iterator[Any]:
@@ -104,12 +136,22 @@ class DiffusionDetachActorWorker(ActorRolloutRefWorker, DetachActorWorker):
                 engine.to("cpu", model=True, optimizer=False, grad=False)
 
     def _snapshot_agreement(self, *flags: bool) -> tuple[bool, ...]:
-        """Agree before helpers, including full-snapshot backends with internal collectives."""
+        """Keep snapshot stages in the same order on every actor rank."""
         if torch.distributed.is_initialized():
             values = torch.tensor(flags, dtype=torch.int32, device=get_device_name())
             torch.distributed.all_reduce(values, op=torch.distributed.ReduceOp.MIN)
             return tuple(bool(value) for value in values.tolist())
         return flags
+
+    def _restore_snapshot_shards(self, module: torch.nn.Module, *state) -> None:
+        error = None
+        try:
+            self.restore_handler(module, *state)
+        except Exception as exc:
+            error = exc
+        if not self._snapshot_agreement(error is None)[0]:
+            # Some local copies may have completed: fail the RPC, never continue training.
+            raise RuntimeError("Actor snapshot restore failed on at least one actor rank") from error
 
     def _supports_trainable_snapshot(self, module: torch.nn.Module) -> bool:
         engine = self.actor.engine
@@ -144,8 +186,8 @@ class DiffusionDetachActorWorker(ActorRolloutRefWorker, DetachActorWorker):
         if not self._snapshot_agreement(error is None and compatible)[0]:
             raise RuntimeError("Trainable snapshot parameter mapping changed on at least one actor rank") from error
 
-        # ParameterList retains the live Parameters; the upstream helper owns shard copies and synchronization.
-        self.restore_handler(view, cpu_sharded_state, global_spec)
+        # ParameterList retains the live Parameters; agreement follows local shard copies.
+        self._restore_snapshot_shards(view, cpu_sharded_state, global_spec)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_model_to_cpu(self, snapshot_id: int) -> None:
@@ -171,11 +213,9 @@ class DiffusionDetachActorWorker(ActorRolloutRefWorker, DetachActorWorker):
             prepared, eligible = self._snapshot_agreement(error is None, eligible)
             if not prepared:
                 raise RuntimeError("Actor snapshot preparation failed on at least one actor rank") from error
-            # The helper owns its collectives. Once it returns, CPU allocation can
-            # still fail locally; no rank may publish/overwrite until all clones exist.
-            state = self.copy_handler(view if eligible else module)
             error = None
             try:
+                state = self.copy_handler(view if eligible else module)
                 saved = _clone_cpu_tensors(state)
                 if eligible:
                     saved = _TrainableSnapshot(
@@ -214,6 +254,6 @@ class DiffusionDetachActorWorker(ActorRolloutRefWorker, DetachActorWorker):
                     error = exc
                 if not self._snapshot_agreement(error is None)[0]:
                     raise RuntimeError("Actor snapshot state is invalid on at least one actor rank") from error
-                self.restore_handler(module, cpu_sharded_state, global_spec)
+                self._restore_snapshot_shards(module, cpu_sharded_state, global_spec)
             else:
-                self.restore_handler(module, saved_model)
+                self._restore_snapshot_shards(module, saved_model)

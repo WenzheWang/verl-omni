@@ -336,6 +336,141 @@ def test_clone_failure_preserves_previous_snapshot_on_every_rank(worker, monkeyp
     assert len(calls) == 3
 
 
+@pytest.mark.parametrize(
+    ("strategy", "copy_name"),
+    [
+        ("fsdp", "fsdp1_sharded_save_to_cpu"),
+        ("fsdp2", "fsdp2_sharded_save_to_cpu"),
+        ("veomni", "fsdp2_sharded_save_to_cpu"),
+    ],
+)
+def test_strategy_selects_upstream_copy_and_noncollective_restore(strategy, copy_name):
+    worker = object.__new__(snapshots.DiffusionDetachActorWorker)
+    worker.config = OmegaConf.create({"actor": {"strategy": strategy}})
+    worker._strategy_handlers = None
+
+    copy_handler, restore_handler = worker._get_strategy_handlers()
+
+    assert copy_handler.__name__ == copy_name
+    assert restore_handler is snapshots._restore_local_shards
+    assert worker._get_strategy_handlers() == (copy_handler, restore_handler)
+
+
+def test_injected_strategy_handlers_bypass_default_selection(worker):
+    assert worker._get_strategy_handlers() is worker._strategy_handlers
+
+
+def test_restore_local_shards_copies_plain_fsdp1_tensors_and_checks_shape():
+    module = torch.nn.Linear(2, 1)
+    state = {
+        "weight": torch.tensor([[3.0, 4.0]]),
+        "bias": torch.tensor([5.0]),
+    }
+
+    snapshots._restore_local_shards(module, state)
+
+    torch.testing.assert_close(module.weight, state["weight"], rtol=0, atol=0)
+    torch.testing.assert_close(module.bias, state["bias"], rtol=0, atol=0)
+    with pytest.raises(RuntimeError, match="local shard shape changed"):
+        snapshots._restore_local_shards(module, {"weight": torch.ones(2)})
+
+
+@pytest.mark.parametrize("failure", [None, "shape", "mesh", "placement"])
+def test_restore_local_shards_copies_mock_fsdp2_dtensors_and_validates_layout(monkeypatch, failure):
+    monkeypatch.setattr(snapshots, "DTensor", _ShardParameter)
+    mesh = SimpleNamespace(device_type="cpu", mesh=torch.tensor([0, 1]), mesh_dim_names=("fsdp",))
+    module = torch.nn.Module()
+    module.first = _ShardParameter(torch.zeros(2))
+    module.second = _ShardParameter(torch.zeros(1))
+    module.first.device_mesh = mesh
+    module.second.device_mesh = mesh
+    module.first.placements = ("shard-0",)
+    module.second.placements = ("shard-0",)
+    target_spec = SimpleNamespace(device_mesh=mesh, placements=("shard-0",))
+    saved_spec = SimpleNamespace(placements=("shard-0",))
+    state = {
+        "first": (torch.tensor([1.0, 2.0]), saved_spec),
+        "second": (torch.tensor([3.0]), saved_spec),
+    }
+    if failure == "shape":
+        state["first"] = (torch.ones(3), saved_spec)
+    elif failure == "mesh":
+        target_spec = SimpleNamespace(device_mesh=object(), placements=("shard-0",))
+    elif failure == "placement":
+        state["first"] = (torch.ones(2), SimpleNamespace(placements=("replicate",)))
+
+    if failure is None:
+        snapshots._restore_local_shards(module, state, target_spec)
+        torch.testing.assert_close(module.first, torch.tensor([1.0, 2.0]), rtol=0, atol=0)
+        torch.testing.assert_close(module.second, torch.tensor([3.0]), rtol=0, atol=0)
+    else:
+        messages = {
+            "shape": "local shard shape changed",
+            "mesh": "device mesh changed",
+            "placement": "shard placements changed",
+        }
+        with pytest.raises(RuntimeError, match=messages[failure]):
+            snapshots._restore_local_shards(module, state, target_spec)
+
+
+@pytest.mark.parametrize(
+    ("operation", "failure_rank", "offload", "full_fallback"),
+    [
+        ("save", "local", False, False),
+        ("save", "remote", True, True),
+        ("restore", "local", True, False),
+        ("restore", "remote", False, True),
+    ],
+)
+def test_helper_failure_is_agreed_for_trainable_and_full_snapshots(
+    worker, monkeypatch, operation, failure_rank, offload, full_fallback
+):
+    engine = worker.actor.engine
+    engine.is_param_offload_enabled = offload
+    if full_fallback:
+        engine._uses_fsdp2_cpu_offload_policy = True
+    worker.save_model_to_cpu(0)
+    old = worker.cpu_saved_models[0]
+    assert isinstance(old, snapshots._TrainableSnapshot) is not full_fallback
+    copy_handler, restore_handler = worker._strategy_handlers
+    worker.test_transitions.clear()
+
+    def fail(*_args, **_kwargs):
+        raise ValueError("injected local helper failure")
+
+    if failure_rank == "local":
+        worker._strategy_handlers = (
+            fail if operation == "save" else copy_handler,
+            fail if operation == "restore" else restore_handler,
+        )
+    else:
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        calls = []
+        failure_call = 3 if operation == "save" else 4
+
+        def fail_remote(flag, op):
+            assert op == torch.distributed.ReduceOp.MIN
+            calls.append(flag.tolist())
+            if len(calls) == failure_call:
+                flag.zero_()
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", fail_remote)
+
+    message = "CPU capture failed" if operation == "save" else "restore failed"
+    with pytest.raises(RuntimeError, match=message) as caught:
+        if operation == "save":
+            worker.save_model_to_cpu(0)
+        else:
+            worker.restore_model_from_cpu(0)
+    if failure_rank == "local":
+        assert isinstance(caught.value.__cause__, ValueError)
+    else:
+        assert caught.value.__cause__ is None
+        assert len(calls) == failure_call
+    assert worker.cpu_saved_models[0] is old
+    assert worker.test_transitions == [("cpu", True, False, False)] * (2 if offload else 0)
+
+
 def test_snapshot_save_failure_does_not_publish_and_reoffloads(worker):
     worker.actor.engine.is_param_offload_enabled = True
 
@@ -343,8 +478,10 @@ def test_snapshot_save_failure_does_not_publish_and_reoffloads(worker):
         raise RuntimeError("injected copy failure")
 
     worker._strategy_handlers = (fail, worker.restore_handler)
-    with pytest.raises(RuntimeError, match="injected copy failure"):
+    with pytest.raises(RuntimeError, match="Actor snapshot CPU capture failed") as caught:
         worker.save_model_to_cpu(0)
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert "injected copy failure" in str(caught.value.__cause__)
     assert worker.cpu_saved_models == {}
     assert worker.test_transitions == [("cpu", True, False, False)] * 2
 

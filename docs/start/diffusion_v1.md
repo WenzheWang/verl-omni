@@ -1,6 +1,6 @@
 # Diffusion V1 training
 
-Last updated: 09/17/2026
+Last updated: 09/21/2026
 
 This guide runs the diffusion V1 trainer in synchronous or separate-asynchronous
 mode using the provided Stable Diffusion 3.5 Medium FlowGRPO OCR recipes.
@@ -163,7 +163,12 @@ when manual parameter offload is enabled. FSDP1 and other backends, multiple
 policy adapters, native FSDP2 CPU offload policy, and full-parameter training
 retain full snapshots. Changing the trainable parameter set or shard layout
 within a snapshot's lifetime is unsupported and fails before restore. Qwen-Image
-is only the benchmark fixture below, not an eligibility requirement.
+is the validation fixture, not an eligibility restriction. FSDP snapshot copy
+and restore failures are reported across actor ranks before the RPC returns.
+A failed save preserves the previous snapshot. A restore can fail after some
+local shards were copied: the training step fails rather than continuing with
+mixed weights; this does not provide transactional rollback or recovery from
+a failed process or accelerator collective.
 
 For steady-state, unmerged LoRA weight synchronization with manual actor
 parameter offload, the actor first gathers independent CPU adapter tensors and

@@ -238,6 +238,74 @@ def _run_case(model_path, offload):
         torch.testing.assert_close(torch.as_tensor(actual["loss"]), torch.as_tensor(expected["loss"]), rtol=0, atol=0)
     assert report["arms"]["True"]["payload_bytes"] < report["arms"]["False"]["payload_bytes"]
 
+    # Inject rank-local failures around the real noncollective shard helpers. Every rank must
+    # leave the wrapper at the same stage, and a later collective must remain usable.
+    injected_failures = 0
+    for trainable_only, failure_worker in ((False, baseline), (True, worker)):
+        copy_handler, restore_handler = failure_worker._get_strategy_handlers()
+        assert restore_handler is snapshots._restore_local_shards
+        for operation in ("save", "restore"):
+            for timing in ("before", "partial"):
+                snapshot_id = 100 + injected_failures
+                failure_worker.save_model_to_cpu(snapshot_id)
+                previous = failure_worker.cpu_saved_models[snapshot_id]
+                assert isinstance(previous, _TrainableSnapshot) is trainable_only
+                expected = _state(engine)
+                if operation == "restore":
+                    changed = next(
+                        param
+                        for param in engine.module.parameters()
+                        if param.requires_grad and isinstance(param, DTensor)
+                    )
+                    with torch.no_grad():
+                        changed.to_local().add_(1)
+
+                def injected_copy(module, timing=timing, copy_handler=copy_handler):
+                    if dist.get_rank() != 1:
+                        return copy_handler(module)
+                    if timing == "partial":
+                        first = next(param for param in module.parameters() if isinstance(param, DTensor))
+                        copy_handler(torch.nn.ParameterList([first]))
+                    raise ValueError(f"rank-local {timing} copy failure")
+
+                def injected_restore(module, state, *spec, timing=timing, restore_handler=restore_handler):
+                    if dist.get_rank() != 1:
+                        return restore_handler(module, state, *spec)
+                    if timing == "partial":
+                        first = next(
+                            name
+                            for name, param in module.named_parameters()
+                            if param.requires_grad and name in state and state[name][1] is not None
+                        )
+                        restore_handler(module, {first: state[first]}, *spec)
+                    raise ValueError(f"rank-local {timing} restore failure")
+
+                failure_worker._strategy_handlers = (
+                    injected_copy if operation == "save" else copy_handler,
+                    injected_restore if operation == "restore" else restore_handler,
+                )
+                message = "CPU capture failed" if operation == "save" else "restore failed"
+                try:
+                    with pytest.raises(RuntimeError, match=message):
+                        if operation == "save":
+                            failure_worker.save_model_to_cpu(snapshot_id)
+                        else:
+                            failure_worker.restore_model_from_cpu(snapshot_id)
+                finally:
+                    failure_worker._strategy_handlers = (copy_handler, restore_handler)
+                if operation == "save":
+                    assert failure_worker.cpu_saved_models[snapshot_id] is previous
+
+                probe = torch.ones((), device=torch.cuda.current_device())
+                dist.all_reduce(probe)
+                assert probe.item() == dist.get_world_size()
+                if operation == "restore":
+                    failure_worker.restore_model_from_cpu(snapshot_id)
+                    _assert_equal(_state(engine), expected)
+                failure_worker.clear_cpu_model(snapshot_id)
+                injected_failures += 1
+    report["injected_helper_failures"] = injected_failures
+
     worker = _worker(engine, True)
     worker.save_model_to_cpu(0)
     before = _state(engine)
