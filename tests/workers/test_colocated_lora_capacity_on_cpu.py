@@ -36,9 +36,13 @@ def _worker(*, offload=True, free_cache=True, lora=True, base_synced=True, merge
     capacity_enforced = offload and lora and base_synced and not merged
 
     worker = object.__new__(ew.ActorRolloutRefWorker)
-    engine = MagicMock()
+    engine = MagicMock(spec=["is_param_offload_enabled", "module", "get_per_tensor_param", "to"])
     engine.is_param_offload_enabled = offload
-    engine.module = SimpleNamespace(peft_config={"default": object()}) if lora else SimpleNamespace()
+    engine.module = (
+        SimpleNamespace(peft_config={"default": SimpleNamespace(to_dict=lambda: {"r": 8})})
+        if lora
+        else SimpleNamespace()
+    )
 
     def gather(**kwargs):
         events.append(("gather", kwargs))
