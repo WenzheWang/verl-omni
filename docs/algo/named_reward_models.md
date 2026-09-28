@@ -1,6 +1,6 @@
 # Named Reward Models
 
-Last updated: 09/26/2026
+Last updated: 09/28/2026
 
 This guide describes how to configure and extend named model-backed rewards
 under `reward.models` in `verl-omni`. For the general Reward Loop interface and
@@ -58,8 +58,12 @@ Omit this field or set it to `null` to keep static splitting. Engine models reje
 this option; their internal scheduling and parallelism remain engine-owned.
 
 Choose a batch size large enough for efficient model batching but small enough
-to leave work available for faster replicas. This controls reward-loop sample
-dispatch, not the model's own inference batch size. Opt in only when samples can
+to leave work available for faster replicas. It caps the in-flight samples per
+replica, so it also limits how many single-sample requests can be waiting for a
+model consumer. For PickScore, whose native consumer caps each forward at 16,
+one inference per sample and `dispatch_batch_size: 8` can coalesce at most eight
+requests. Values above 16 can reduce RPC count but cannot raise that forward
+batch cap; an actual forward can still be smaller. Opt in only when samples can
 be scored independently: batch-sensitive or replica-local random scorers can
 change scores when batch boundaries or replica assignments change.
 
@@ -461,15 +465,20 @@ python tests/reward_loop/benchmark_replica_dispatch.py \
 ```
 
 It warms each configuration and records six paired rounds of 128 samples,
-alternating execution order and the slow replica. Conditions include balanced
-service and explicit synthetic per-sample delays; the latter demonstrate
-sensitivity to imbalance, not naturally occurring model latency. Every arm
-checks score parity, ordering, exact-once dispatch and bounded concurrency.
+alternating execution order and the slow replica. The synthetic delay is one
+`coefficient * len(sample_ids)` sleep per RPC before that RPC queues concurrent
+single-sample scoring; it occupies that replica's sole in-flight RPC and is not
+an independent per-sample scoring delay. It demonstrates conditional load
+redistribution under this imposed imbalance, not a general scoring speedup or
+natural model latency. Every arm checks score parity, ordering, exact-once
+dispatch and bounded concurrency.
 
 Timings cover dispatch and scoring with resident models and actor-cached images.
 They exclude model loading, offloading and full image-payload transfer, and are
 not end-to-end training measurements. Small microbatches can reduce batching
-efficiency; retain the static default unless a representative workload benefits.
+efficiency: with one inference per sample, a size of 4 underfills PickScore's
+16-request consumer cap. Retain the static default unless a representative
+workload benefits.
 
 ## Current limitations
 

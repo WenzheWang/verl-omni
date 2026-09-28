@@ -14,7 +14,8 @@
 """Paired two-GPU benchmark for native reward-replica dispatch.
 
 This measures dispatcher behavior with ID-only transport and cached images. The
-configured delay is a synthetic per-sample service-cost perturbation, not
+configured delay is one synthetic RPC-level sleep before that RPC queues its
+concurrent per-sample scoring, not independent per-sample scoring latency or
 evidence of naturally occurring replica latency or full trainer throughput.
 """
 
@@ -156,6 +157,7 @@ class _PickScoreReplica:
         delay = self.delay_coefficient * len(sample_ids)
         started = time.perf_counter()
         try:
+            # Hold this RPC before it queues concurrent per-sample scoring.
             if delay:
                 await asyncio.sleep(delay)
             return await OmniRewardLoopWorker.compute_score_batch(self, data)
