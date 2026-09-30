@@ -540,5 +540,10 @@ class vLLMOmniReplica(vLLMReplica):
         )
         self.server_class = ray.remote(vLLMOmniHttpServer)
 
+    # The rollout worker actor class is verl's default
+    # (ray.remote(CheckpointEngineWorker)): the omni_delta_sharded backend
+    # passes verl's sglang-only "delta_sharded" gate by name and resolves
+    # through CheckpointEngineRegistry like any other backend.
+
     def _get_server_name_prefix(self) -> str:
         return "vllm_omni_"
