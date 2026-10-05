@@ -467,12 +467,14 @@ def test_delta_apply_rejects_npu_platform(monkeypatch):
 
 
 def test_registry_keeps_verl_server_adapter():
-    """The delta wire rides verl's stock named_tensors bucketed channel, so the
-    rollout class is verl's own ServerAdapter -- no omni subclass at any pin."""
+    """The delta wire rides verl's stock named_tensors bucketed channel; the omni
+    subclass only remaps SP ranks and inherits every transport method."""
     from verl.workers.rollout.base import get_rollout_class
     from verl.workers.rollout.vllm_rollout.vllm_rollout import ServerAdapter
 
-    assert get_rollout_class("vllm_omni", "async") is ServerAdapter
+    adapter_class = get_rollout_class("vllm_omni", "async")
+    assert issubclass(adapter_class, ServerAdapter)
+    assert {name for name, value in vars(adapter_class).items() if callable(value)} == {"__init__"}
 
 
 def _flattened_pairs(flushes):
