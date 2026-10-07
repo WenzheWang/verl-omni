@@ -102,7 +102,10 @@ class MultiRewardModelManager:
 
     async def wake_up(self) -> None:
         """Wake independent reward models concurrently."""
-        await asyncio.gather(*(model.wake_up() for model in self.models.values()))
+        results = await asyncio.gather(*(model.wake_up() for model in self.models.values()), return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
     async def sleep(self) -> None:
         """Attempt to sleep every model and report the first lifecycle error."""
@@ -264,8 +267,14 @@ class NativeManagedRewardModel(ManagedRewardModel):
     async def _run_worker_lifecycle(self, method: str) -> None:
         if self._workers is None:
             raise RuntimeError(f"Native reward model {self.name!r} has no bound workers")
-        refs = [getattr(worker, method).remote(self.name) for worker in self._workers]
-        await asyncio.gather(*refs)
+
+        async def run_worker(worker):
+            await getattr(worker, method).remote(self.name)
+
+        results = await asyncio.gather(*(run_worker(worker) for worker in self._workers), return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
     async def wake_up(self) -> None:
         if not self.offload and self._resident:

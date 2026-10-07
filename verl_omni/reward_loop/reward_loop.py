@@ -285,6 +285,23 @@ class OmniRewardLoopManager(RewardLoopManager):
             return asyncio.run(self.async_compute_rm_score(data))
         raise RuntimeError("compute_rm_score() cannot run inside an event loop; await async_compute_rm_score() instead")
 
+    async def _drain_lifecycle(self, operation):
+        """Keep accepted lifecycle work owned until completion, even on cancellation."""
+        pending = asyncio.ensure_future(operation)
+        cancellation = None
+        while not pending.done():
+            try:
+                await asyncio.shield(pending)
+            except asyncio.CancelledError as exc:
+                cancellation = exc
+            except Exception:
+                if cancellation is None:
+                    raise
+                logger.exception("Reward lifecycle failed while draining cancellation")
+        if cancellation is not None:
+            raise cancellation
+        return pending.result()
+
     async def async_compute_rm_score(self, data):
         """Score named reward models without blocking the caller's event loop."""
         if not self.multi_reward_model_manager.models:
@@ -292,14 +309,14 @@ class OmniRewardLoopManager(RewardLoopManager):
         async with self._score_lock:
             scoring_error = None
             try:
-                await self.multi_reward_model_manager.wake_up()
+                await self._drain_lifecycle(self.multi_reward_model_manager.wake_up())
                 return await self._compute_named_model_scores(data)
             except BaseException as exc:
                 scoring_error = exc
                 raise
             finally:
                 try:
-                    await self.multi_reward_model_manager.sleep()
+                    await self._drain_lifecycle(self.multi_reward_model_manager.sleep())
                 except Exception:
                     if scoring_error is None:
                         raise

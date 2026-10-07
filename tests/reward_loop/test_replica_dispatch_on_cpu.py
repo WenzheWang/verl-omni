@@ -264,6 +264,68 @@ async def test_synchronous_remote_failure_drains_an_active_peer_without_new_disp
     assert failure_calls == [[0]]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
+@pytest.mark.parametrize("cancel_count", [1, 2], ids=["cancel-once", "cancel-twice"])
+async def test_caller_cancellation_drains_each_accepted_rpc_without_replenishing(dynamic, cancel_count):
+    calls = [[], []]
+    entered = [asyncio.Event(), asyncio.Event()]
+    release = [asyncio.Event(), asyncio.Event()]
+    completed = [asyncio.Event(), asyncio.Event()]
+    rpc_cancelled = [False, False]
+
+    def blocking_worker(index):
+        async def compute(data):
+            sample_ids = _sample_ids(data)
+            calls[index].append(sample_ids)
+            entered[index].set()
+            try:
+                await release[index].wait()
+            except asyncio.CancelledError:
+                rpc_cancelled[index] = True
+                raise
+            completed[index].set()
+            return sample_ids
+
+        return _worker(compute)
+
+    # Dynamic dispatch has queued samples beyond the two accepted RPCs.
+    batch_sizes = {"native": 1} if dynamic else {}
+    task = asyncio.create_task(
+        dispatch_reward_groups(_data(5), {"native": [blocking_worker(0), blocking_worker(1)]}, batch_sizes)
+    )
+    try:
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in entered)), timeout=5)
+        for _ in range(cancel_count):
+            assert task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            assert rpc_cancelled == [False, False]
+            assert not any(event.is_set() for event in completed)
+
+        release[0].set()
+        await asyncio.wait_for(completed[0].wait(), timeout=5)
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert not completed[1].is_set()
+        assert [len(worker_calls) for worker_calls in calls] == [1, 1]
+
+        release[1].set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(task), timeout=5)
+
+        assert task.cancelled()
+        assert all(event.is_set() for event in completed)
+        assert rpc_cancelled == [False, False]
+        assert [len(worker_calls) for worker_calls in calls] == [1, 1]
+        if dynamic:
+            assert calls == [[[0]], [[1]]]
+    finally:
+        for event in release:
+            event.set()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
+
+
 def test_dispatch_state_is_local_to_each_asyncio_run_call():
     calls = []
     worker = _recording_worker(calls)

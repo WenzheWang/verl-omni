@@ -1410,3 +1410,171 @@ async def test_named_model_repeated_cancellation_drains_active_rpcs_before_lifec
 
     assert calls.index(("remote_0_exit", 1)) < calls.index("sleep")
     assert calls.index(("remote_1_exit", 1)) < calls.index("sleep")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["wake_up", "sleep"])
+async def test_cancellation_during_lifecycle_drains_before_releasing_score_lock(phase):
+    calls = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    completed = asyncio.Event()
+    rpc_cancelled = []
+
+    async def lifecycle(method):
+        calls.append(method)
+        if method == phase and not completed.is_set():
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                rpc_cancelled.append(method)
+                raise
+            completed.set()
+
+    models = object.__new__(MultiRewardModelManager)
+    models.models = {
+        "native": SimpleNamespace(
+            name="native",
+            wake_up=lambda: lifecycle("wake_up"),
+            sleep=lambda: lifecycle("sleep"),
+        )
+    }
+    manager = object.__new__(OmniRewardLoopManager)
+    manager._score_lock = asyncio.Lock()
+    manager.multi_reward_model_manager = models
+
+    async def score(data):
+        calls.append(f"score:{data}")
+        return data
+
+    manager._compute_named_model_scores = score
+    first = asyncio.create_task(manager.async_compute_rm_score("first"))
+    second = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        second = asyncio.create_task(manager.async_compute_rm_score("second"))
+        for _ in range(2):
+            assert first.cancel()
+            await asyncio.sleep(0)
+            assert not first.done()
+            assert manager._score_lock.locked()
+            assert rpc_cancelled == []
+        assert calls.count("wake_up") == 1
+        assert "score:second" not in calls
+        if phase == "wake_up":
+            assert "sleep" not in calls
+            assert "score:first" not in calls
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(first), timeout=5)
+        assert completed.is_set()
+        assert await asyncio.wait_for(second, timeout=5) == "second"
+        assert rpc_cancelled == []
+        assert not manager._score_lock.locked()
+        assert calls.count("sleep") == 2
+    finally:
+        release.set()
+        tasks = [first] if second is None else [first, second]
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["wake_up", "sleep"])
+@pytest.mark.parametrize("synchronous", [False, True], ids=["async-failure", "submission-failure"])
+async def test_native_lifecycle_failure_drains_accepted_worker_before_return(phase, synchronous):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    completed = asyncio.Event()
+    rpc_tasks = []
+
+    async def peer(name):
+        await release.wait()
+        completed.set()
+
+    def submit_peer(name):
+        entered.set()
+        rpc = asyncio.create_task(peer(name))
+        rpc_tasks.append(rpc)
+        return rpc
+
+    async def fail(name):
+        await entered.wait()
+        raise RuntimeError("lifecycle failed")
+
+    def submit_failure(name):
+        assert entered.is_set()
+        raise RuntimeError("lifecycle failed")
+
+    model = NativeManagedRewardModel(
+        "native",
+        OmegaConf.create(
+            {"backend": "native", "executor": {"model": "tests.fake:Model"}, "placement": {"devices": [0]}}
+        ),
+    )
+    method = f"{phase}_reward_model"
+    model.bind_workers(
+        [
+            SimpleNamespace(**{method: SimpleNamespace(remote=submit_peer)}),
+            SimpleNamespace(**{method: SimpleNamespace(remote=submit_failure if synchronous else fail)}),
+        ]
+    )
+    model._resident = phase == "sleep"
+    task = asyncio.create_task(getattr(model, phase)())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        done, _ = await asyncio.wait({task}, timeout=0.05)
+        assert not done
+        release.set()
+        with pytest.raises(RuntimeError, match="lifecycle failed"):
+            await asyncio.wait_for(asyncio.shield(task), timeout=5)
+        assert completed.is_set()
+        assert model._resident == (phase == "sleep")
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(task, *rpc_tasks, return_exceptions=True), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_model_wake_failure_drains_other_model_before_sleep():
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    completed = asyncio.Event()
+    calls = []
+
+    async def slow_wake():
+        entered.set()
+        await release.wait()
+        completed.set()
+
+    async def fail_wake():
+        await entered.wait()
+        raise RuntimeError("wake failed")
+
+    async def sleep():
+        assert completed.is_set()
+        calls.append("sleep")
+
+    models = object.__new__(MultiRewardModelManager)
+    models.models = {
+        "slow": SimpleNamespace(name="slow", wake_up=slow_wake, sleep=sleep),
+        "fail": SimpleNamespace(name="fail", wake_up=fail_wake, sleep=sleep),
+    }
+    manager = object.__new__(OmniRewardLoopManager)
+    manager._score_lock = asyncio.Lock()
+    manager.multi_reward_model_manager = models
+    manager._compute_named_model_scores = AsyncMock()
+    task = asyncio.create_task(manager.async_compute_rm_score("unused"))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        done, _ = await asyncio.wait({task}, timeout=0.05)
+        assert not done
+        assert calls == []
+        release.set()
+        with pytest.raises(RuntimeError, match="wake failed"):
+            await asyncio.wait_for(asyncio.shield(task), timeout=5)
+        assert calls == ["sleep", "sleep"]
+        manager._compute_named_model_scores.assert_not_awaited()
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
