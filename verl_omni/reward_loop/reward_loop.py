@@ -37,6 +37,7 @@ from .reward_model import MultiRewardModelManager
 from .reward_model_executor import (
     EngineRewardExecutor,
     NativeRewardExecutor,
+    _await_owned,
     build_engine_reward_executors,
     build_native_reward_executors,
 )
@@ -93,6 +94,22 @@ class OmniRewardLoopWorker(RewardLoopWorker):
         except KeyError as exc:
             raise ValueError(f"Worker has no native reward model {model_name!r}") from exc
         await executor.sleep()
+
+    async def close_reward_model(self, name: str | None = None) -> None:
+        await _await_owned(self._close_reward_model(name))
+
+    async def _close_reward_model(self, name: str | None = None) -> None:
+        if name is None:
+            executors = self.native_reward_executors.values()
+        else:
+            try:
+                executors = (self.native_reward_executors[name],)
+            except KeyError as exc:
+                raise ValueError(f"Worker has no native reward model {name!r}") from exc
+        results = await asyncio.gather(*(executor.close() for executor in executors), return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
 
 class OmniRewardLoopManager(RewardLoopManager):

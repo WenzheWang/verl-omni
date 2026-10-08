@@ -35,6 +35,7 @@ from verl_omni.workers.config.reward import (
 )
 
 from .accelerator_reward_workers import _IndexedResourcePool
+from .reward_model_executor import _await_owned
 
 __all__ = [
     "EngineManagedRewardModel",
@@ -115,6 +116,17 @@ class MultiRewardModelManager:
                 logger.error("Failed to sleep reward model %s: %s", model.name, result)
         if errors:
             raise errors[0]
+
+    async def close_native_models(self) -> None:
+        """Release native models permanently without changing engine lifecycle."""
+        await _await_owned(self._close_native_models())
+
+    async def _close_native_models(self) -> None:
+        models = [model for model in self.models.values() if isinstance(model, NativeManagedRewardModel)]
+        results = await asyncio.gather(*(model.close() for model in models), return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
     @staticmethod
     def _validate_native_device_assignments(
@@ -257,6 +269,7 @@ class NativeManagedRewardModel(ManagedRewardModel):
         # the current native lifecycle contract; a restarted worker must be
         # rebound and woken by a future recovery implementation.
         self._resident = False
+        self._closed = False
 
     def bind_workers(self, workers) -> None:
         self._workers = list(workers)
@@ -265,19 +278,42 @@ class NativeManagedRewardModel(ManagedRewardModel):
         if self._workers is None:
             raise RuntimeError(f"Native reward model {self.name!r} has no bound workers")
         refs = [getattr(worker, method).remote(self.name) for worker in self._workers]
-        await asyncio.gather(*refs)
+        results = await asyncio.gather(*refs, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
     async def wake_up(self) -> None:
+        await _await_owned(self._wake_up())
+
+    async def _wake_up(self) -> None:
+        if self._closed:
+            raise RuntimeError(f"Native reward model {self.name!r} is closed")
         if not self.offload and self._resident:
             return
         await self._run_worker_lifecycle("wake_up_reward_model")
         self._resident = True
 
     async def sleep(self) -> None:
+        await _await_owned(self._sleep())
+
+    async def _sleep(self) -> None:
+        if self._closed:
+            return
         if not self.offload:
             return
         await self._run_worker_lifecycle("sleep_reward_model")
         self._resident = False
+
+    async def close(self) -> None:
+        await _await_owned(self._close())
+
+    async def _close(self) -> None:
+        if self._closed:
+            return
+        await self._run_worker_lifecycle("close_reward_model")
+        self._resident = False
+        self._closed = True
 
 
 def _prepare_engine_config(model, base_config, fallback_model=None):

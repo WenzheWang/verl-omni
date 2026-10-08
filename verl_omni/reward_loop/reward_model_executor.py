@@ -34,6 +34,28 @@ __all__ = [
 ]
 
 
+async def _await_owned(awaitable):
+    """Keep an accepted operation owned until it settles, even if its caller leaves."""
+    task = asyncio.ensure_future(awaitable)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if asyncio.current_task().cancelling():
+                cancelled = True
+        except BaseException:
+            if not task.done():
+                raise
+    if cancelled:
+        try:
+            task.result()
+        except BaseException:
+            pass
+        raise asyncio.CancelledError
+    return task.result()
+
+
 class EngineRouterClient:
     """Expose one engine router to a configured reward function."""
 
@@ -74,17 +96,45 @@ class NativeRewardExecutor:
         self._idle = asyncio.Event()
         self._idle.set()
         self._lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
+        self._awake = False
+        self._closed = False
 
     async def wake_up(self) -> None:
-        async with self._lock:
-            if self._model is not None:
+        await _await_owned(self._wake_up())
+
+    async def _wake_up(self) -> None:
+        async with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError(f"Native reward model {self.spec.name!r} is closed")
+            if self._awake:
                 return
-            model_cls = _load_native_model(self.spec.executor_config["model"])
-            kwargs = dict(self.spec.executor_config.get("kwargs", {}))
-            if self.spec.model_path is not None:
-                kwargs.setdefault("model_path", self.spec.model_path)
-            kwargs.setdefault("device", torch.device(get_device_name(), get_device_id()))
-            self._model = model_cls(**kwargs)
+            try:
+                if self._model is None:
+                    model_cls = _load_native_model(self.spec.executor_config["model"])
+                    kwargs = dict(self.spec.executor_config.get("kwargs", {}))
+                    if self.spec.model_path is not None:
+                        kwargs.setdefault("model_path", self.spec.model_path)
+                    kwargs.setdefault("device", torch.device(get_device_name(), get_device_id()))
+                    self._model = model_cls(**kwargs)
+                elif self._supports_cpu_offload(self._model):
+                    await self._call(self._model.wake_up)
+                async with self._lock:
+                    self._awake = True
+            except BaseException:
+                await self._fail_closed()
+                raise
+
+    @staticmethod
+    def _supports_cpu_offload(model) -> bool:
+        return getattr(model, "supports_cpu_offload", None) is True and all(
+            callable(getattr(model, method, None)) for method in ("sleep", "wake_up")
+        )
+
+    @staticmethod
+    async def _call(method):
+        result = await method() if inspect.iscoroutinefunction(method) else await asyncio.to_thread(method)
+        return await result if inspect.isawaitable(result) else result
 
     def reward_kwargs(self) -> dict[str, Any]:
         return {"reward_model": self}
@@ -92,12 +142,16 @@ class NativeRewardExecutor:
     async def infer(self, *args, **kwargs):
         """Run model inference while protecting the wake/sleep boundary."""
         async with self._lock:
-            if self._model is None:
+            if not self._awake or self._closed:
                 raise RuntimeError(f"Native reward model {self.spec.name!r} is not awake")
             self._inflight += 1
             self._idle.clear()
+            model = self._model
+        return await _await_owned(self._infer_owned(model, args, kwargs))
+
+    async def _infer_owned(self, model, args, kwargs):
         try:
-            infer_fn = getattr(self._model, "infer", None)
+            infer_fn = getattr(model, "infer", None)
             if infer_fn is None:
                 raise TypeError(f"Native reward model {type(self._model).__name__!r} must define infer()")
             if inspect.iscoroutinefunction(infer_fn):
@@ -112,21 +166,57 @@ class NativeRewardExecutor:
                     self._idle.set()
 
     async def sleep(self) -> None:
-        while True:
-            await self._idle.wait()
-            async with self._lock:
-                if self._inflight:
-                    continue
-                model, self._model = self._model, None
-                if model is not None:
-                    close = getattr(model, "close", None)
-                    if close is not None:
-                        result = await close() if inspect.iscoroutinefunction(close) else await asyncio.to_thread(close)
-                        if inspect.isawaitable(result):
-                            await result
-                gc.collect()
-                _empty_accelerator_cache()
+        await _await_owned(self._sleep())
+
+    async def _sleep(self) -> None:
+        async with self._lifecycle_lock:
+            if self._closed or not self._awake:
                 return
+            async with self._lock:
+                self._awake = False
+            await self._idle.wait()
+            try:
+                model = self._model
+                if self._supports_cpu_offload(model):
+                    await self._call(model.sleep)
+                else:
+                    self._model = None
+                    await self._dispose(model)
+                _empty_accelerator_cache()
+            except BaseException:
+                await self._fail_closed()
+                raise
+
+    async def close(self) -> None:
+        await _await_owned(self._close())
+
+    async def _close(self) -> None:
+        async with self._lifecycle_lock:
+            if self._closed:
+                return
+            async with self._lock:
+                self._awake = False
+                self._closed = True
+            await self._idle.wait()
+            model, self._model = self._model, None
+            await self._dispose(model)
+            _empty_accelerator_cache()
+
+    async def _fail_closed(self) -> None:
+        async with self._lock:
+            self._awake = False
+            self._closed = True
+        model, self._model = self._model, None
+        await self._dispose(model)
+        _empty_accelerator_cache()
+
+    @classmethod
+    async def _dispose(cls, model) -> None:
+        if model is not None:
+            close = getattr(model, "close", None)
+            if callable(close):
+                await cls._call(close)
+        gc.collect()
 
 
 def build_engine_reward_executors(specs: dict[str, RewardModelSpec]) -> dict[str, EngineRewardExecutor]:
