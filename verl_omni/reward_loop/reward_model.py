@@ -270,6 +270,7 @@ class NativeManagedRewardModel(ManagedRewardModel):
         # rebound and woken by a future recovery implementation.
         self._resident = False
         self._closed = False
+        self._lifecycle_lock = asyncio.Lock()
 
     def bind_workers(self, workers) -> None:
         self._workers = list(workers)
@@ -277,8 +278,16 @@ class NativeManagedRewardModel(ManagedRewardModel):
     async def _run_worker_lifecycle(self, method: str) -> None:
         if self._workers is None:
             raise RuntimeError(f"Native reward model {self.name!r} has no bound workers")
-        refs = [getattr(worker, method).remote(self.name) for worker in self._workers]
+        refs = []
+        submission_error = None
+        try:
+            for worker in self._workers:
+                refs.append(getattr(worker, method).remote(self.name))
+        except BaseException as exc:
+            submission_error = exc
         results = await asyncio.gather(*refs, return_exceptions=True)
+        if submission_error is not None:
+            raise submission_error
         for result in results:
             if isinstance(result, BaseException):
                 raise result
@@ -287,33 +296,36 @@ class NativeManagedRewardModel(ManagedRewardModel):
         await _await_owned(self._wake_up())
 
     async def _wake_up(self) -> None:
-        if self._closed:
-            raise RuntimeError(f"Native reward model {self.name!r} is closed")
-        if not self.offload and self._resident:
-            return
-        await self._run_worker_lifecycle("wake_up_reward_model")
-        self._resident = True
+        async with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError(f"Native reward model {self.name!r} is closed")
+            if not self.offload and self._resident:
+                return
+            await self._run_worker_lifecycle("wake_up_reward_model")
+            self._resident = True
 
     async def sleep(self) -> None:
         await _await_owned(self._sleep())
 
     async def _sleep(self) -> None:
-        if self._closed:
-            return
-        if not self.offload:
-            return
-        await self._run_worker_lifecycle("sleep_reward_model")
-        self._resident = False
+        async with self._lifecycle_lock:
+            if self._closed:
+                return
+            if not self.offload:
+                return
+            await self._run_worker_lifecycle("sleep_reward_model")
+            self._resident = False
 
     async def close(self) -> None:
         await _await_owned(self._close())
 
     async def _close(self) -> None:
-        if self._closed:
-            return
-        await self._run_worker_lifecycle("close_reward_model")
-        self._resident = False
-        self._closed = True
+        async with self._lifecycle_lock:
+            if self._closed:
+                return
+            await self._run_worker_lifecycle("close_reward_model")
+            self._resident = False
+            self._closed = True
 
 
 def _prepare_engine_config(model, base_config, fallback_model=None):

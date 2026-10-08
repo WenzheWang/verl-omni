@@ -224,6 +224,7 @@ async def test_worker_and_manager_forward_final_close_to_native_only():
     model._workers = [SimpleNamespace(close_reward_model=SimpleNamespace(remote=lambda name: asyncio.sleep(0)))]
     model._closed = False
     model._resident = True
+    model._lifecycle_lock = asyncio.Lock()
     manager = object.__new__(MultiRewardModelManager)
     manager.models = {"native": model, "engine": SimpleNamespace(close=AsyncMock())}
     await manager.close_native_models()
@@ -272,6 +273,7 @@ async def test_controller_waits_for_all_worker_refs_before_reporting_failure():
     ]
     model._resident = True
     model._closed = False
+    model._lifecycle_lock = asyncio.Lock()
     closing = asyncio.create_task(model.close())
     await asyncio.sleep(0)
     assert not closing.done()
@@ -299,6 +301,7 @@ async def test_repeated_manager_close_cancellation_waits_for_worker_refs():
     ]
     model._resident = True
     model._closed = False
+    model._lifecycle_lock = asyncio.Lock()
     manager = object.__new__(MultiRewardModelManager)
     manager.models = {"native": model}
     closing = asyncio.create_task(manager.close_native_models())
@@ -337,3 +340,87 @@ async def test_cancelled_worker_close_all_waits_for_every_executor():
     with pytest.raises(asyncio.CancelledError):
         await closing
     assert sorted(settled) == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_failed_final_close_cannot_be_reported_as_success_by_controller(monkeypatch):
+    class Model:
+        def __init__(self, **kwargs):
+            self.close_calls = 0
+
+        async def close(self):
+            self.close_calls += 1
+            raise OSError("close failed")
+
+    executor = _executor(monkeypatch, Model)
+    await executor.wake_up()
+    original = executor._model
+    model = object.__new__(NativeManagedRewardModel)
+    model.spec = SimpleNamespace(name="native")
+    model._workers = [SimpleNamespace(close_reward_model=SimpleNamespace(remote=lambda name: executor.close()))]
+    model._resident = True
+    model._closed = False
+    model._lifecycle_lock = asyncio.Lock()
+    with pytest.raises(OSError, match="close failed"):
+        await model.close()
+    with pytest.raises(RuntimeError, match="cleanup previously failed"):
+        await model.close()
+    assert not model._closed and model._resident
+    assert executor._closed and executor._model is None
+    assert original.close_calls == 1
+    with pytest.raises(RuntimeError, match="closed"):
+        await executor.wake_up()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["wake_up", "sleep"])
+async def test_transfer_error_survives_failed_cleanup(monkeypatch, caplog, method):
+    class Model:
+        supports_cpu_offload = True
+
+        def __init__(self, **kwargs):
+            self.close_calls = 0
+
+        async def sleep(self):
+            if method == "sleep":
+                raise OSError("transfer failed")
+
+        async def wake_up(self):
+            raise OSError("transfer failed")
+
+        async def close(self):
+            self.close_calls += 1
+            raise ValueError("cleanup failed")
+
+    executor = _executor(monkeypatch, Model)
+    await executor.wake_up()
+    original = executor._model
+    if method == "wake_up":
+        await executor.sleep()
+    with pytest.raises(OSError, match="transfer failed"):
+        await getattr(executor, method)()
+    assert "cleanup failed" in caplog.text
+    with pytest.raises(RuntimeError, match="cleanup previously failed"):
+        await executor.close()
+    assert original.close_calls == 1
+    assert executor._closed and not executor._awake
+
+
+@pytest.mark.asyncio
+async def test_reconstruction_sleep_preserves_failed_disposal_state(monkeypatch):
+    class Model:
+        def __init__(self, **kwargs):
+            self.close_calls = 0
+
+        async def close(self):
+            self.close_calls += 1
+            raise OSError("disposal failed")
+
+    executor = _executor(monkeypatch, Model)
+    await executor.wake_up()
+    original = executor._model
+    with pytest.raises(OSError, match="disposal failed"):
+        await executor.sleep()
+    with pytest.raises(RuntimeError, match="cleanup previously failed"):
+        await executor.close()
+    assert executor._closed and original.close_calls == 1

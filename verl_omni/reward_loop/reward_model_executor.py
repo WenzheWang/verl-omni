@@ -19,6 +19,7 @@ import asyncio
 import gc
 import importlib
 import inspect
+import logging
 from typing import Any
 
 import torch
@@ -32,6 +33,8 @@ __all__ = [
     "build_engine_reward_executors",
     "build_native_reward_executors",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 async def _await_owned(awaitable):
@@ -99,6 +102,7 @@ class NativeRewardExecutor:
         self._lifecycle_lock = asyncio.Lock()
         self._awake = False
         self._closed = False
+        self._close_failed = False
 
     async def wake_up(self) -> None:
         await _await_owned(self._wake_up())
@@ -181,7 +185,9 @@ class NativeRewardExecutor:
                     await self._call(model.sleep)
                 else:
                     self._model = None
+                    self._close_failed = True
                     await self._dispose(model)
+                    self._close_failed = False
                 _empty_accelerator_cache()
             except BaseException:
                 await self._fail_closed()
@@ -193,22 +199,34 @@ class NativeRewardExecutor:
     async def _close(self) -> None:
         async with self._lifecycle_lock:
             if self._closed:
+                if self._close_failed:
+                    raise RuntimeError(f"Native reward model {self.spec.name!r} cleanup previously failed")
                 return
             async with self._lock:
                 self._awake = False
                 self._closed = True
             await self._idle.wait()
             model, self._model = self._model, None
+            self._close_failed = True
             await self._dispose(model)
             _empty_accelerator_cache()
+            self._close_failed = False
 
     async def _fail_closed(self) -> None:
         async with self._lock:
             self._awake = False
             self._closed = True
         model, self._model = self._model, None
-        await self._dispose(model)
-        _empty_accelerator_cache()
+        if model is None and self._close_failed:
+            return
+        self._close_failed = True
+        try:
+            await self._dispose(model)
+            _empty_accelerator_cache()
+        except BaseException:
+            logger.exception("Failed to clean up native reward model %s", self.spec.name)
+        else:
+            self._close_failed = False
 
     @classmethod
     async def _dispose(cls, model) -> None:
