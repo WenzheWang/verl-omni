@@ -49,6 +49,9 @@ class VLLMOmniHijack:
             return
         VLLMOmniHijack._patched = True
 
+        from verl_omni.utils.vllm_omni.patch import patch_vllm_lora_weights_mapper
+
+        patch_vllm_lora_weights_mapper()
         # verl's base vLLM LoRA hijack first, then the vllm-omni diffusion patches.
         VLLMHijack.hijack()
 
