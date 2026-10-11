@@ -551,7 +551,7 @@ async def test_ar_strategy_retains_requested_stage_outputs_and_targets_weight_sy
 
         async def collective_rpc(self, **kwargs):
             self.rpc_kwargs = kwargs
-            return "rpc-result"
+            return [None]
 
     class Adapter(OmniRolloutPipelineBase):
         @staticmethod
@@ -610,6 +610,89 @@ async def test_ar_strategy_retains_requested_stage_outputs_and_targets_weight_sy
     assert output.token_ids == [7]
     assert output.extra_fields == {"global_steps": 3, "audio_sample_rate": 24_000}
     assert strategy._rollout_fields_by_request_id == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reply",
+    [
+        [{"supported": False, "error": "unsupported LoRA weight"}],
+        [[None], [{"error": "second replica failed"}]],
+        [{"todo": True}],
+        [{"supported": False, "error": ""}],
+        None,
+        [],
+        [[]],
+    ],
+)
+async def test_weight_sync_rejects_best_effort_rpc_failures(reply):
+    server = object.__new__(server_module.vLLMOmniHttpServer)
+    server.engine = SimpleNamespace(collective_rpc=AsyncMock(return_value=reply))
+    server._generate_strategy = SimpleNamespace(collective_rpc_stage_ids=lambda method: [0])
+    with pytest.raises(RuntimeError, match="update_weights_from_ipc failed"):
+        await server.collective_rpc("update_weights_from_ipc", kwargs={"base_sync_done": True})
+    server.engine.collective_rpc.assert_awaited_once_with(
+        method="update_weights_from_ipc", timeout=None, args=(), kwargs={"base_sync_done": True}, stage_ids=[0]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reply", [[None], [[True], [None]], [{"supported": True}], [(None,)]])
+async def test_weight_sync_accepts_successful_rpc_results(reply):
+    server = object.__new__(server_module.vLLMOmniHttpServer)
+    server.engine = SimpleNamespace(collective_rpc=AsyncMock(return_value=reply))
+    server._generate_strategy = SimpleNamespace(collective_rpc_stage_ids=lambda method: None)
+    assert await server.collective_rpc("update_weights_from_ipc") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [ValueError("worker failed"), TimeoutError("control timed out")])
+async def test_weight_sync_preserves_raised_error_and_other_controls(error):
+    server = object.__new__(server_module.vLLMOmniHttpServer)
+    server.engine = SimpleNamespace(collective_rpc=AsyncMock(side_effect=error))
+    server._generate_strategy = SimpleNamespace(collective_rpc_stage_ids=lambda method: None)
+    with pytest.raises(type(error)) as raised:
+        await server.collective_rpc("update_weights_from_ipc")
+    assert raised.value is error
+    server.engine.collective_rpc = AsyncMock(return_value=[{"supported": False, "error": "optional control"}])
+    assert await server.collective_rpc("optional_control") is None
+
+
+@pytest.mark.asyncio
+async def test_weight_sync_rejects_fewer_replies_than_selected_stages():
+    server = object.__new__(server_module.vLLMOmniHttpServer)
+    server.engine = SimpleNamespace(collective_rpc=AsyncMock(return_value=[None]))
+    server._generate_strategy = SimpleNamespace(collective_rpc_stage_ids=lambda method: [0, 1])
+    with pytest.raises(RuntimeError, match="fewer results than selected stages"):
+        await server.collective_rpc("update_weights_from_ipc")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [RuntimeError("receiver failed"), TimeoutError("receiver timed out")])
+async def test_weight_sync_rejects_pinned_stage_pool_error_envelope(error):
+    from vllm_omni.engine.stage_pool import StagePool
+    from vllm_omni.entrypoints import AsyncOmni
+
+    # Exercise the pinned producer's exception-to-data conversion, not a
+    # fabricated error dictionary. No model or transport process is needed.
+    pool = object.__new__(StagePool)
+    pool.stage_id = 0
+    pool.clients = [SimpleNamespace(stage_type="diffusion", collective_rpc_async=AsyncMock(side_effect=error))]
+
+    async def dispatch(**kwargs):
+        kwargs.pop("stage_ids")
+        return [await pool.collective_rpc(replica_id=0, **kwargs)]
+
+    omni = SimpleNamespace(engine=SimpleNamespace(collective_rpc_async=dispatch))
+
+    async def collective_rpc(**kwargs):
+        return await AsyncOmni.collective_rpc(omni, **kwargs)
+
+    server = object.__new__(server_module.vLLMOmniHttpServer)
+    server.engine = SimpleNamespace(collective_rpc=collective_rpc)
+    server._generate_strategy = SimpleNamespace(collective_rpc_stage_ids=lambda method: [0])
+    with pytest.raises(RuntimeError, match="timed out" if isinstance(error, TimeoutError) else str(error)):
+        await server.collective_rpc("update_weights_from_ipc")
 
 
 def test_ar_strategy_preserves_qwen3_omni_thinker_only_contract():

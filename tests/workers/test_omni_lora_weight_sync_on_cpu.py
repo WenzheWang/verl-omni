@@ -67,7 +67,7 @@ def _fast_path_worker(rollout_rank=0):
     return worker
 
 
-def _run_update(worker, **kwargs):
+def _run_update(worker, *, entry=None, **kwargs):
     # This regression test covers weight-version stamping, not background thread scheduling.
     async def run_in_event_loop(function, *args, **kwargs):
         return function(*args, **kwargs)
@@ -81,7 +81,8 @@ def _run_update(worker, **kwargs):
         patch.object(ew, "set_expandable_segments", MagicMock()),
         patch.object(ew, "get_torch_device", return_value=MagicMock(current_device=MagicMock(return_value=0))),
     ):
-        asyncio.run(ew.ActorRolloutRefWorker.update_weights(worker, mode="naive", **kwargs))
+        update = entry or ew.ActorRolloutRefWorker.update_weights
+        asyncio.run(update(worker, mode="naive", **kwargs))
     return sender
 
 
@@ -123,5 +124,85 @@ def test_lora_fast_path_stamp_gated_to_rollout_rank_zero():
     worker = _fast_path_worker(rollout_rank=1)
     _run_update(worker, global_steps=7)
 
+    worker.rollout.server_handle.clear_kv_cache.remote.assert_not_awaited()
+    worker.rollout.server_handle.set_global_steps.remote.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "reply,stage_ids",
+    [
+        ([{"supported": False, "error": "receiver failed"}], [0]),
+        ([], [0]),
+        ([[]], [0]),
+        ([[None], [{"error": "second replica failed"}]], [0]),
+        ([None], [0, 1]),
+    ],
+)
+def test_lora_fast_path_rejected_rpc_does_not_publish_weight_version(reply, stage_ids):
+    from verl_omni.workers.rollout.vllm_rollout.vllm_omni_async_server import vLLMOmniHttpServer
+
+    worker = _fast_path_worker()
+    server = object.__new__(vLLMOmniHttpServer)
+    server.engine = SimpleNamespace(collective_rpc=AsyncMock(return_value=reply))
+    server._generate_strategy = SimpleNamespace(collective_rpc_stage_ids=lambda method: stage_ids)
+
+    async def execute(method, non_block, kwargs):
+        assert method == "update_weights_from_ipc"
+        assert non_block is True
+        return asyncio.create_task(server.collective_rpc(method, kwargs=kwargs))
+
+    worker.rollout._execute_method = AsyncMock(side_effect=execute)
+    with pytest.raises(RuntimeError, match="update_weights_from_ipc failed"):
+        _run_update(worker, global_steps=7)
+
+    server.engine.collective_rpc.assert_awaited_once()
+    worker.rollout.server_handle.clear_kv_cache.remote.assert_not_awaited()
+    worker.rollout.server_handle.set_global_steps.remote.assert_not_awaited()
+
+
+def test_lora_fast_path_cancelled_rpc_does_not_publish_weight_version():
+    worker = _fast_path_worker()
+
+    async def execute(method, non_block, kwargs):
+        async def cancelled_rpc():
+            raise asyncio.CancelledError
+
+        return asyncio.create_task(cancelled_rpc())
+
+    worker.rollout._execute_method = AsyncMock(side_effect=execute)
+    with pytest.raises(asyncio.CancelledError):
+        _run_update(worker, global_steps=7)
+
+    worker.rollout.server_handle.clear_kv_cache.remote.assert_not_awaited()
+    worker.rollout.server_handle.set_global_steps.remote.assert_not_awaited()
+
+
+def test_lora_fast_path_active_caller_cancellation_does_not_publish_weight_version():
+    worker = _fast_path_worker()
+
+    async def cancel_active_update(worker, **kwargs):
+        entered = asyncio.Event()
+        pending = []
+
+        async def execute(method, non_block, kwargs):
+            async def blocked_rpc():
+                entered.set()
+                await asyncio.Event().wait()
+
+            future = asyncio.create_task(blocked_rpc())
+            pending.append(future)
+            return future
+
+        worker.rollout._execute_method = AsyncMock(side_effect=execute)
+        task = asyncio.create_task(ew.ActorRolloutRefWorker.update_weights(worker, **kwargs))
+        await entered.wait()
+        assert not task.done()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert len(pending) == 1
+        assert pending[0].cancelled()
+
+    _run_update(worker, entry=cancel_active_update, global_steps=7)
     worker.rollout.server_handle.clear_kv_cache.remote.assert_not_awaited()
     worker.rollout.server_handle.set_global_steps.remote.assert_not_awaited()

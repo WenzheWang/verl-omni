@@ -288,13 +288,35 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         kwargs: dict[str, Any] | None = None,
     ):
         """Dispatch a shared RPC to the stages selected by the active strategy."""
-        await self.engine.collective_rpc(
+        stage_ids = self._generate_strategy.collective_rpc_stage_ids(method)
+        results = await self.engine.collective_rpc(
             method=method,
             timeout=timeout,
             args=args,
             kwargs=kwargs,
-            stage_ids=self._generate_strategy.collective_rpc_stage_ids(method),
+            stage_ids=stage_ids,
         )
+        if method == "update_weights_from_ipc":
+            # AsyncOmni returns best-effort stage errors as data. Do not let
+            # weight-sync callers publish a new version after a failed update.
+            if not isinstance(results, list | tuple) or not results:
+                raise RuntimeError(f"{method} failed: missing replica results")
+            # Results are flattened across replicas, without stage identities.
+            # This lower bound is not proof that every requested stage replied.
+            if stage_ids is not None and len(results) < len(stage_ids):
+                raise RuntimeError(f"{method} failed: fewer results than selected stages")
+
+            def check_result(result: Any) -> None:
+                if isinstance(result, list | tuple):
+                    if not result:
+                        raise RuntimeError(f"{method} failed: empty worker results")
+                    for item in result:
+                        check_result(item)
+                elif isinstance(result, dict):
+                    if result.get("error") or result.get("todo") or result.get("supported") is False:
+                        raise RuntimeError(f"{method} failed: {result}")
+
+            check_result(results)
 
     # -----------------------------------------------------------------------
     # wake_up hook: full wake must include kv_cache
