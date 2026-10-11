@@ -421,7 +421,7 @@ async def test_ar_strategy_retains_requested_stage_outputs_and_targets_weight_sy
 
         async def collective_rpc(self, **kwargs):
             self.rpc_kwargs = kwargs
-            return "rpc-result"
+            return [None]
 
     class Adapter:
         @staticmethod
