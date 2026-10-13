@@ -414,6 +414,7 @@ async def test_ar_strategy_retains_requested_stage_outputs_and_targets_weight_sy
         def __init__(self):
             self.generate_kwargs = None
             self.rpc_kwargs = None
+            self.num_stages = 1
 
         async def generate(self, **kwargs):
             self.generate_kwargs = kwargs

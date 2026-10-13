@@ -135,7 +135,7 @@ def test_lora_fast_path_stamp_gated_to_rollout_rank_zero():
         ([], [0]),
         ([[]], [0]),
         ([[None], [{"error": "second replica failed"}]], [0]),
-        ([None], [0, 1]),
+        ([None, None], [0, 1]),
     ],
 )
 def test_lora_fast_path_rejected_rpc_does_not_publish_weight_version(reply, stage_ids):
@@ -143,7 +143,10 @@ def test_lora_fast_path_rejected_rpc_does_not_publish_weight_version(reply, stag
 
     worker = _fast_path_worker()
     server = object.__new__(vLLMOmniHttpServer)
-    server.engine = SimpleNamespace(collective_rpc=AsyncMock(return_value=reply))
+    server.engine = SimpleNamespace(
+        num_stages=2,
+        collective_rpc=AsyncMock(side_effect=lambda **kwargs: reply if kwargs["stage_ids"] == [0] else []),
+    )
     server._generate_strategy = SimpleNamespace(collective_rpc_stage_ids=lambda method: stage_ids)
 
     async def execute(method, non_block, kwargs):
@@ -155,7 +158,7 @@ def test_lora_fast_path_rejected_rpc_does_not_publish_weight_version(reply, stag
     with pytest.raises(RuntimeError, match="update_weights_from_ipc failed"):
         _run_update(worker, global_steps=7)
 
-    server.engine.collective_rpc.assert_awaited_once()
+    assert server.engine.collective_rpc.await_count == len(stage_ids)
     worker.rollout.server_handle.clear_kv_cache.remote.assert_not_awaited()
     worker.rollout.server_handle.set_global_steps.remote.assert_not_awaited()
 

@@ -289,22 +289,20 @@ class vLLMOmniHttpServer(vLLMHttpServer):
     ):
         """Dispatch a shared RPC to the stages selected by the active strategy."""
         stage_ids = self._generate_strategy.collective_rpc_stage_ids(method)
-        results = await self.engine.collective_rpc(
-            method=method,
-            timeout=timeout,
-            args=args,
-            kwargs=kwargs,
-            stage_ids=stage_ids,
-        )
         if method == "update_weights_from_ipc":
+            num_stages = getattr(self.engine, "num_stages", None)
+            if type(num_stages) is not int or num_stages <= 0:
+                raise RuntimeError(f"{method} failed: unknown stage topology")
+            if stage_ids is None:
+                stage_ids = list(range(num_stages))
+            if not isinstance(stage_ids, list | tuple) or not stage_ids:
+                raise RuntimeError(f"{method} failed: no selected stages")
+            if any(type(stage_id) is not int or not 0 <= stage_id < num_stages for stage_id in stage_ids):
+                raise RuntimeError(f"{method} failed: unknown selected stage")
+
             # AsyncOmni returns best-effort stage errors as data. Do not let
             # weight-sync callers publish a new version after a failed update.
-            if not isinstance(results, list | tuple) or not results:
-                raise RuntimeError(f"{method} failed: missing replica results")
-            # Results are flattened across replicas, without stage identities.
-            # This lower bound is not proof that every requested stage replied.
-            if stage_ids is not None and len(results) < len(stage_ids):
-                raise RuntimeError(f"{method} failed: fewer results than selected stages")
+            # The flattened reply has no stage IDs, so request one stage at a time.
 
             def check_result(result: Any) -> None:
                 if isinstance(result, list | tuple):
@@ -316,7 +314,25 @@ class vLLMOmniHttpServer(vLLMHttpServer):
                     if result.get("error") or result.get("todo") or result.get("supported") is False:
                         raise RuntimeError(f"{method} failed: {result}")
 
-            check_result(results)
+            for stage_id in dict.fromkeys(stage_ids):
+                results = await self.engine.collective_rpc(
+                    method=method,
+                    timeout=timeout,
+                    args=args,
+                    kwargs=kwargs,
+                    stage_ids=[stage_id],
+                )
+                if not isinstance(results, list | tuple) or not results:
+                    raise RuntimeError(f"{method} failed: missing replica results for stage {stage_id}")
+                check_result(results)
+        else:
+            await self.engine.collective_rpc(
+                method=method,
+                timeout=timeout,
+                args=args,
+                kwargs=kwargs,
+                stage_ids=stage_ids,
+            )
 
     # -----------------------------------------------------------------------
     # wake_up hook: full wake must include kv_cache
