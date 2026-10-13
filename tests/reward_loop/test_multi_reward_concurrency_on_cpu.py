@@ -49,6 +49,15 @@ class _EngineExecutor:
         return {"reward_router_address": "engine-router", "model_name": "engine"}
 
 
+class _NativeExecutor:
+    def __init__(self, model, omit_model=False):
+        self.model = model
+        self.omit_model = omit_model
+
+    def reward_kwargs(self):
+        return {} if self.omit_model else {"reward_model": self.model}
+
+
 def _term(name="_async_score", **options):
     return {"path": REWARDS_PATH, "name": name, **options}
 
@@ -116,6 +125,96 @@ def test_engine_term_opts_in_and_reserved_field_is_not_forwarded():
     manager.set_reward_executors({"engine": _EngineExecutor()}, None)
     result = manager.loop.run_until_complete(manager.run_single(_sample("engine-sample")))
     assert result["reward_score"] == 1.0
+
+
+@pytest.mark.parametrize("independent", [False, True])
+def test_batch_and_reserved_kwargs_through_serial_and_independent_paths(independent):
+    manager = _manager(
+        {
+            "explicit": _term(independent=independent, routing_weights={"actor": 1.0}),
+            "kwargs_only": _term(independent=independent, routing_weights={"actor": 1.0}),
+        },
+        concurrency=2,
+    )
+    sample = _sample("sample")
+    seen = []
+
+    async def explicit(batch, data_source, **kwargs):
+        assert batch is sample
+        assert data_source == "sample"
+        assert "independent" not in kwargs
+        assert "routing_weights" not in kwargs
+        seen.append("explicit")
+        return 1.0
+
+    async def kwargs_only(**kwargs):
+        assert "batch" not in kwargs
+        assert "independent" not in kwargs
+        assert "routing_weights" not in kwargs
+        seen.append("kwargs_only")
+        return 2.0
+
+    _replace(manager, "explicit", explicit)
+    _replace(manager, "kwargs_only", kwargs_only)
+    result = manager.loop.run_until_complete(manager.run_single(sample))
+    assert seen == ["explicit", "kwargs_only"]
+    assert result["reward_score"] == 3.0
+    assert list(result["reward_extra_info"]) == ["reward/explicit", "reward/kwargs_only", "reward/combined"]
+
+
+def test_native_barrier_keeps_batch_binding_and_valid_fps_after_independent_window():
+    manager = _manager(
+        {"first": _term(independent=True), "native": _term(model="native", required=False, fps=24.0)},
+        concurrency=2,
+        models={"native": {"backend": "native"}},
+    )
+    sample = _sample("sample")
+    model = object()
+    manager.set_reward_executors(None, {"native": _NativeExecutor(model)})
+    calls = []
+
+    async def first(data_source):
+        calls.append("first")
+        return 1.0
+
+    async def native(batch, reward_model, fps):
+        assert batch is sample
+        assert reward_model is model
+        assert fps == 24.0
+        calls.append("native")
+        return 2.0
+
+    _replace(manager, "first", first)
+    _replace(manager, "native", native)
+    result = manager.loop.run_until_complete(manager.run_single(sample))
+    assert calls == ["first", "native"]
+    assert result["reward_score"] == 3.0
+
+
+@pytest.mark.parametrize("missing_model, fps", [(True, 24.0), (False, 0.0)])
+def test_native_argument_errors_after_independent_window_are_fatal_for_optional_term(missing_model, fps):
+    manager = _manager(
+        {"first": _term(independent=True), "native": _term(model="native", required=False, fps=fps)},
+        concurrency=2,
+        models={"native": {"backend": "native"}},
+    )
+    manager.set_reward_executors(None, {"native": _NativeExecutor(None if missing_model else object(), missing_model)})
+    calls = []
+
+    async def first(data_source):
+        calls.append("first")
+        return 1.0
+
+    async def native(reward_model, fps):
+        calls.append("native")
+        return 2.0
+
+    _replace(manager, "first", first)
+    _replace(manager, "native", native)
+    error = "reward_model" if missing_model else "fps must be finite and positive"
+    with pytest.raises(ValueError, match=error):
+        manager.loop.run_until_complete(manager.run_single(_sample("sample")))
+    assert calls == ["first"]
 
 
 @pytest.mark.parametrize("concurrency", [1, 2])
@@ -604,6 +703,108 @@ def test_repeated_cancellation_drains_active_and_waiting_tasks():
         assert sorted(settled) == ["0", "1"]
         assert (await manager.run_single(_sample("again")))["reward_score"] == 1.0
         assert active == 0
+
+    manager.loop.run_until_complete(scenario())
+
+
+def test_repeated_cancellation_drains_active_and_queued_terms_in_one_window():
+    manager = _manager({"first": _term(independent=True), "second": _term(independent=True)}, concurrency=2)
+
+    async def scenario():
+        blocker_started = asyncio.Event()
+        blocker_second_done = asyncio.Event()
+        blocker_release = asyncio.Event()
+        target_started = asyncio.Event()
+        cleanup_entered = asyncio.Event()
+        repeat_cancel_seen = asyncio.Event()
+        cleanup_release = asyncio.Event()
+        target_exited = asyncio.Event()
+        fresh_started = asyncio.Event()
+        target_second_calls = 0
+
+        async def first(data_source):
+            if data_source == "blocker":
+                blocker_started.set()
+                await blocker_release.wait()
+            elif data_source == "target":
+                target_started.set()
+                try:
+                    await cleanup_release.wait()
+                except asyncio.CancelledError:
+                    cleanup_entered.set()
+                    while not cleanup_release.is_set():
+                        try:
+                            await cleanup_release.wait()
+                        except asyncio.CancelledError:
+                            repeat_cancel_seen.set()
+                finally:
+                    target_exited.set()
+            else:
+                assert target_exited.is_set()
+                fresh_started.set()
+            return 1.0
+
+        async def second(data_source):
+            nonlocal target_second_calls
+            if data_source == "blocker":
+                blocker_second_done.set()
+            elif data_source == "target":
+                target_second_calls += 1
+            else:
+                assert target_exited.is_set()
+                fresh_started.set()
+            return 1.0
+
+        _replace(manager, "first", first)
+        _replace(manager, "second", second)
+        blocker = asyncio.create_task(manager.run_single(_sample("blocker")))
+        target = fresh = None
+
+        async def wait_for_queued(count):
+            while len(manager._multi_reward_semaphore._waiters or ()) < count:
+                await asyncio.sleep(0)
+
+        try:
+            await asyncio.wait_for(blocker_started.wait(), 1)
+            await asyncio.wait_for(blocker_second_done.wait(), 1)
+            target = asyncio.create_task(manager.run_single(_sample("target")))
+            await asyncio.wait_for(target_started.wait(), 1)
+            await asyncio.wait_for(wait_for_queued(1), 1)
+            assert target_second_calls == 0
+
+            target.cancel()
+            await asyncio.wait_for(cleanup_entered.wait(), 1)
+            assert not target.done()
+            fresh = asyncio.create_task(manager.run_single(_sample("fresh")))
+            await asyncio.wait_for(wait_for_queued(2), 1)
+            target.cancel()
+            await asyncio.wait_for(repeat_cancel_seen.wait(), 1)
+            assert not target.done()
+            assert not fresh_started.is_set()
+            assert target_second_calls == 0
+
+            cleanup_release.set()
+            await asyncio.wait_for(fresh_started.wait(), 1)
+            with pytest.raises(asyncio.CancelledError):
+                await target
+            assert target_exited.is_set()
+            assert target_second_calls == 0
+
+            blocker_release.set()
+            assert (await asyncio.wait_for(blocker, 1))["reward_score"] == 2.0
+            assert (await asyncio.wait_for(fresh, 1))["reward_score"] == 2.0
+            assert manager._multi_reward_semaphore._value == 2
+            assert not manager._multi_reward_semaphore._waiters
+        finally:
+            cleanup_release.set()
+            blocker_release.set()
+            if target is not None and not target.done():
+                target.cancel()
+            tasks = (task for task in (blocker, target, fresh) if task is not None)
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                1,
+            )
 
     manager.loop.run_until_complete(scenario())
 

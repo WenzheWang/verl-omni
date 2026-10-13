@@ -16,6 +16,7 @@
 import asyncio
 import inspect
 import logging
+import math
 from abc import ABC, abstractmethod
 from collections import ChainMap
 
@@ -86,7 +87,16 @@ class MultiRewardManager(RewardManagerBase, ABC):
 
         self._sub_rewards = []
         total_weight = 0.0
-        _reserved_keys = {"path", "name", "weight", "required", "model", "independent", "use_rollout_sampling_params"}
+        _reserved_keys = {
+            "path",
+            "name",
+            "weight",
+            "required",
+            "model",
+            "independent",
+            "routing_weights",
+            "use_rollout_sampling_params",
+        }
         for key, entry in reward_functions_cfg.items():
             model_name = resolve_reward_model_name(key, entry, reward_models_cfg)
             use_rollout_sampling_params = entry.get("use_rollout_sampling_params", False)
@@ -118,6 +128,8 @@ class MultiRewardManager(RewardManagerBase, ABC):
             independent = entry.get("independent", False)
             if not isinstance(independent, bool):
                 raise TypeError(f"Reward function {key!r} independent must be a boolean")
+            if config.reward.get("aggregation") == "preserve_components" and (not required or weight != 1.0):
+                raise ValueError("Component rewards require required=true and weight=1.0; use routing_weights instead.")
             total_weight += weight
 
             # Collect non-manager fields to pass to compute_score.
@@ -173,19 +185,24 @@ class MultiRewardManager(RewardManagerBase, ABC):
     async def _build_reward_kwargs(self, data_item: DataProto) -> dict:
         """Build scorer kwargs for one sample in a modality-specific subclass."""
 
-    async def _run_multi_reward(self, all_kwargs: dict) -> dict:
+    async def _run_multi_reward(self, all_kwargs: dict, data: DataProto) -> dict:
         """Execute configured reward terms and preserve their weighted outputs."""
         combined_score = 0.0
         reward_extra_info = {}
         admitted_tasks = []
 
         def prepare_term(sub):
+            key = sub["key"]
             sig = sub["sig"]
             extra_args = sub["extra_args"]
             model_name = sub["model"]
 
             # Merge per-reward extra config fields into kwargs
             sub_kwargs = {**all_kwargs, **extra_args}
+            # Multimodal scorers may explicitly request the complete single sample.
+            # Do not change kwargs received by existing **kwargs-only scorers.
+            if sig is not None and "batch" in sig.parameters:
+                sub_kwargs["batch"] = data
             filtered_kwargs = _filter_kwargs(sub_kwargs, sig) if sig is not None else {}
 
             if model_name is not None:
@@ -205,6 +222,23 @@ class MultiRewardManager(RewardManagerBase, ABC):
                 if reward_kwargs is None:
                     raise RuntimeError(f"Reward model {model_name!r} cannot be used with a reward function")
                 filtered_kwargs = _filter_kwargs({**sub_kwargs, **reward_kwargs()}, sig)
+
+            native_model_arg = sig.parameters.get("reward_model") if sig is not None else None
+            if native_model_arg is not None and native_model_arg.default is inspect.Parameter.empty:
+                try:
+                    sig.bind(**filtered_kwargs)
+                except TypeError as exc:
+                    raise ValueError(f"Invalid arguments for sub-reward {key!r}: {exc}") from exc
+                fps_arg = sig.parameters.get("fps")
+                if fps_arg is not None and fps_arg.default is inspect.Parameter.empty:
+                    fps = filtered_kwargs["fps"]
+                    message = f"Invalid arguments for sub-reward {key!r}: fps must be finite and positive, got {fps!r}"
+                    try:
+                        numeric_fps = float(fps)
+                    except (TypeError, ValueError, OverflowError) as exc:
+                        raise ValueError(message) from exc
+                    if isinstance(fps, bool) or not math.isfinite(numeric_fps) or numeric_fps <= 0:
+                        raise ValueError(message)
             return filtered_kwargs
 
         async def run_term(sub, filtered_kwargs):
@@ -320,7 +354,7 @@ class MultiRewardManager(RewardManagerBase, ABC):
         """Prepare one sample through the subclass input contract, then aggregate."""
         if len(data) != 1:
             raise ValueError(f"{type(self).__name__} scores one sample at a time, got batch size {len(data)}.")
-        return await self._run_multi_reward(await self._build_reward_kwargs(data[0]))
+        return await self._run_multi_reward(await self._build_reward_kwargs(data[0]), data)
 
 
 class MultiVisualRewardManager(MultiRewardManager):

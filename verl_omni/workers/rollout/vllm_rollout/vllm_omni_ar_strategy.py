@@ -223,6 +223,10 @@ class ARStrategy(OmniStrategyBase):
         engine_kwargs["deploy_config"] = deploy_path
 
     def prepare_engine_args(self, engine_args: dict[str, Any], args: Namespace) -> None:
+        if engine_args.get("enable_lora"):
+            from verl_omni.utils.vllm_omni.patch import patch_vllm_omni_lora_config
+
+            patch_vllm_omni_lora_config()
         if self._rollout_output_modalities is not None:
             # The generated per-stage deploy config owns model_stage for
             # multi-output pipelines.

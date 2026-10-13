@@ -706,6 +706,66 @@ def test_denoise_locked_audio_rows_sets_branch_and_prev_sample(monkeypatch) -> N
     torch.testing.assert_close(trajectory["h3_audio_timesteps"], torch.ones((1, 2)))
 
 
+_EDIT_ROW_KEYS = (
+    "video_edit_clean_rows",
+    "video_edit_mask_rows",
+    "video_edit_restore_mask_rows",
+    "audio_edit_clean_rows",
+    "audio_edit_mask_rows",
+    "audio_edit_restore_mask_rows",
+)
+
+
+class _InputsAccepted(Exception):
+    """Raised by the stubbed noise sampler to prove diffuse() got past its input gate."""
+
+
+def _diffuse_with_forwarded(**forwarded):
+    pipeline = object.__new__(MiniMaxH3PipelineWithLogProb)
+    pipeline.device = torch.device("cpu")
+    pipeline._initial_noise = MagicMock(side_effect=_InputsAccepted)
+    return pipeline.diffuse(
+        task="t2va",
+        text_embeddings=torch.zeros(2, 8),
+        text_tags=torch.ones(2, dtype=torch.long),
+        seed=7,
+        latent_t=1,
+        latent_h=4,
+        latent_w=4,
+        audio_t=3,
+        num_frames=1,
+        num_steps=6,
+        video_shift=12.0,
+        audio_shift=3.0,
+        visual_condition=None,
+        visual_condition_shape=None,
+        audio_condition=None,
+        ref_audio_t=None,
+        **forwarded,
+    )
+
+
+@pytest.mark.parametrize("key", [*_EDIT_ROW_KEYS, "some_future_upstream_input"])
+def test_denoise_rejects_unsupported_forwarded_inputs_instead_of_ignoring_them(key) -> None:
+    """vLLM-Omni forwards latent-edit rows; FlowGRPO has no edit path, so silently dropping them would
+    train on plain generations while the request asked for an edit."""
+    with pytest.raises(NotImplementedError, match=key):
+        _diffuse_with_forwarded(**{key: torch.zeros(2, 4)})
+
+
+def test_denoise_rejects_a_complete_edit_request() -> None:
+    rows = {key: torch.zeros(2, 4) for key in _EDIT_ROW_KEYS}
+    with pytest.raises(NotImplementedError) as excinfo:
+        _diffuse_with_forwarded(**rows)
+    assert all(key in str(excinfo.value) for key in _EDIT_ROW_KEYS)
+
+
+def test_denoise_accepts_unused_forwarded_inputs_set_to_none() -> None:
+    """Upstream always forwards every denoise input key, with None for the ones the request does not use."""
+    with pytest.raises(_InputsAccepted):
+        _diffuse_with_forwarded(**dict.fromkeys(_EDIT_ROW_KEYS))
+
+
 def _batched_actor_payload(batch_size: int = 2) -> dict[str, torch.Tensor]:
     """Repeat a valid single-sample rollout payload into one Actor micro-batch."""
     payload = _trajectory()
