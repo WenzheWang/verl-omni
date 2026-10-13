@@ -160,8 +160,16 @@ The rules distinguish numerical failure from sustained risk signals:
   DiffusionNFT and distillation, do not receive ratio or grouped-reward warnings.
 - `max_staleness=null` disables the staleness rule. Set an explicit budget to
   warn on sustained `training/off_policy/trajectory_staleness_worst/max` above
-  it. This budget is in model versions, not seconds or the sampler's trajectory
-  span limit.
+  it. The metric is `(global_steps - 1) - min_global_steps` over each nonpadding
+  trajectory, then the batch maximum. An on-policy `sync` batch can report
+  `-1`: this is valid healthy coverage and can end an alert episode. For example,
+  `max_staleness=2` warns after a complete window above `2`, not at `2` or
+  `-1`: a submission three outer steps behind the current step has lag `2`
+  and is still within that budget. This model-version lag differs from the replay-buffer span
+  `global_steps - prompt_global_steps + 1`; the budget is not a span limit.
+
+In `separate_async`, ratio and gradient warnings use metrics aggregated for the
+outer training step, not each local actor update.
 
 Defaults are configurable diagnostic heuristics, not CI gates or validated
 collapse thresholds. Sustained rules skip five accepted observations after

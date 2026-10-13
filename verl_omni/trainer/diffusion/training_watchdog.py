@@ -225,7 +225,7 @@ class TrainingWatchdog:
                 alerts.append(alert)
 
         staleness = _scalar(metrics, _STALENESS)
-        if self.max_staleness is not None and staleness is not None and staleness >= 0:
+        if self.max_staleness is not None and staleness is not None:
             coverage["trajectory_staleness"] = 1.0
             stale_evidence = {_STALENESS: staleness}
             stale_faulty = staleness > self.max_staleness

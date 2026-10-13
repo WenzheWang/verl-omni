@@ -15,6 +15,7 @@
 
 from dataclasses import FrozenInstanceError
 
+import numpy as np
 import pytest
 
 from verl_omni.trainer.diffusion.training_watchdog import TrainingWatchdog
@@ -124,6 +125,48 @@ def test_staleness_is_optional_and_measured_in_versions():
     assert enabled.observe(0, metrics)[0][0].evidence == metrics
 
 
+def test_sync_minus_one_staleness_recovers_and_rearms_after_spikes():
+    key = "training/off_policy/trajectory_staleness_worst/max"
+    watchdog = TrainingWatchdog("unknown", window_size=2, warmup_steps=0, cooldown_steps=3, max_staleness=2)
+
+    def metric(global_steps, min_global_steps):
+        min_gs = np.array([min_global_steps], dtype=np.int64)
+        return {key: ((global_steps - 1) - min_gs).max()}
+
+    rows = _replay(
+        watchdog,
+        [
+            (10, metric(10, 10)),  # On-policy sync produces a numpy integer -1.
+            (11, {}),
+            (12, {key: float("nan")}),
+            (13, metric(13, 9)),
+            (14, metric(14, 10)),
+            (15, {}),
+            (16, metric(16, 12)),
+            (17, metric(17, 13)),
+            (18, metric(18, 18)),  # Known healthy -1 ends the alert episode.
+            (19, metric(19, 15)),
+            (20, metric(20, 16)),
+        ],
+    )
+    assert [data["watchdog/coverage/trajectory_staleness"] for _, data in rows] == [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        0.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+    ]
+    assert [len(alerts) for alerts, _ in rows] == [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1]
+    assert [(rows[i][0][0].first_step, rows[i][0][0].last_step) for i in (4, 10)] == [(13, 14), (19, 20)]
+    assert rows[4][0][0].evidence[key] == 3.0
+
+
 def test_nonfinite_gradient_is_immediate_even_during_warmup_and_latched():
     watchdog = TrainingWatchdog("unknown", warmup_steps=5, cooldown_steps=0)
     rows = _replay(
@@ -195,7 +238,7 @@ def test_cooldown_is_accepted_observations_not_step_distance():
     assert [len(alerts) for alerts, _ in rows] == [1, 0, 0, 0, 1]
 
 
-@pytest.mark.parametrize("bad", [None, True, "1", object(), float("nan"), float("inf"), -1.0])
+@pytest.mark.parametrize("bad", [None, True, "1", object(), float("nan"), float("inf")])
 def test_invalid_metric_never_coerced_or_counted(bad):
     watchdog = TrainingWatchdog("flow_grpo", window_size=1, warmup_steps=0, max_staleness=0)
     metrics = {**_reward(), "actor/ratio_mean": bad, "training/off_policy/trajectory_staleness_worst/max": bad}
