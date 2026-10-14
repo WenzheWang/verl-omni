@@ -249,20 +249,9 @@ class MultiRewardManager(RewardManagerBase, ABC):
                 if sub["is_async"]:
                     return await fn(**filtered_kwargs)
                 future = self.loop.run_in_executor(None, lambda f=fn, kw=filtered_kwargs: f(**kw))
-                try:
-                    return await asyncio.shield(future)
-                except asyncio.CancelledError:
-                    # The thread keeps running after its await is cancelled.
-                    # Retain ownership (and any semaphore permit) until it exits.
-                    settled = asyncio.gather(future, return_exceptions=True)
-                    while not settled.done():
-                        try:
-                            await asyncio.shield(settled)
-                        except asyncio.CancelledError:
-                            pass
-                    raise
+                return await future
 
-            if self._multi_reward_semaphore is None:
+            if not sub["independent"] or self._multi_reward_semaphore is None:
                 return await invoke()
             async with self._multi_reward_semaphore:
                 return await invoke()

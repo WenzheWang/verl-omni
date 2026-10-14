@@ -270,11 +270,15 @@ it does not copy large image or other payloads.
 
 Adjacent independent terms execute in windows of at most
 `multi_reward_concurrency`; any other term is an ordering barrier for its
-sample. When the cap is above one, it bounds active scorer calls across all
-samples handled by one reward worker. Scores, diagnostics,
-and required/optional error handling remain in configuration order. The cap
-limits active scorer calls, not the number of reward workers or engine-side
-requests. Increasing it does not establish a throughput improvement by itself.
+sample. When the cap is above one, it bounds active independent scorer calls
+across all samples handled by one reward worker. Barriers do not use the cap
+and retain cross-sample concurrency, even while independent calls are active.
+Scores, diagnostics, and required/optional error handling remain in
+configuration order. The cap does not limit reward workers, barrier calls, or
+engine-side requests. Increasing it does not establish a throughput
+improvement by itself. Cancelling a serial synchronous scorer stops its caller
+without waiting for its executor thread; the thread may continue until the
+scorer returns.
 An admitted window settles all its terms before reporting a contract error.
 
 ## Component rewards and consumer support

@@ -554,12 +554,13 @@ def test_worker_cap_applies_across_samples_and_restores_permits():
     manager.loop.run_until_complete(scenario())
 
 
-def test_barriers_share_worker_cap_with_independent_terms_across_samples():
+def test_barriers_do_not_consume_independent_worker_cap_across_samples():
     manager = _manager({"independent": _term(independent=True), "barrier": _term()}, concurrency=2)
 
     async def scenario():
         two_barriers = asyncio.Event()
-        release = asyncio.Event()
+        release_barriers = asyncio.Event()
+        release_third = asyncio.Event()
         third_independent = asyncio.Event()
         active = maximum = 0
         barrier_count = 0
@@ -570,6 +571,11 @@ def test_barriers_share_worker_cap_with_independent_terms_across_samples():
             maximum = max(maximum, active)
             if data_source == "third":
                 third_independent.set()
+                try:
+                    await release_third.wait()
+                finally:
+                    active -= 1
+                return 1.0
             active -= 1
             return 1.0
 
@@ -581,7 +587,7 @@ def test_barriers_share_worker_cap_with_independent_terms_across_samples():
             if barrier_count == 2:
                 two_barriers.set()
             try:
-                await release.wait()
+                await release_barriers.wait()
                 return 1.0
             finally:
                 active -= 1
@@ -589,23 +595,58 @@ def test_barriers_share_worker_cap_with_independent_terms_across_samples():
         _replace(manager, "independent", independent)
         _replace(manager, "barrier", barrier)
         first_two = [asyncio.create_task(manager.run_single(_sample(str(i)))) for i in range(2)]
+        third = None
         try:
             await asyncio.wait_for(two_barriers.wait(), 1)
             assert active == 2
             third = asyncio.create_task(manager.run_single(_sample("third")))
-
-            async def wait_for_waiter():
-                while not manager._multi_reward_semaphore._waiters:
-                    await asyncio.sleep(0)
-
-            await asyncio.wait_for(wait_for_waiter(), 1)
-            assert not third_independent.is_set()
+            await asyncio.wait_for(third_independent.wait(), 1)
+            assert active == 3
+            assert barrier_count == 2
         finally:
-            release.set()
+            release_third.set()
+            release_barriers.set()
+            tasks = first_two + ([third] if third is not None else [])
+            await asyncio.gather(*tasks, return_exceptions=True)
+        assert third is not None
         results = await asyncio.gather(*first_two, third)
         assert [result["reward_score"] for result in results] == [2.0, 2.0, 2.0]
         assert third_independent.is_set()
-        assert maximum == 2
+        assert maximum == 3
+        assert active == 0
+
+    manager.loop.run_until_complete(scenario())
+
+
+def test_barrier_only_samples_keep_cross_sample_concurrency_above_one():
+    manager = _manager({"barrier": _term()}, concurrency=2)
+
+    async def scenario():
+        all_entered = asyncio.Event()
+        release = asyncio.Event()
+        active = 0
+
+        async def barrier(data_source):
+            nonlocal active
+            active += 1
+            if active == 3:
+                all_entered.set()
+            try:
+                await release.wait()
+                return 1.0
+            finally:
+                active -= 1
+
+        _replace(manager, "barrier", barrier)
+        callers = [asyncio.create_task(manager.run_single(_sample(str(i)))) for i in range(3)]
+        try:
+            await asyncio.wait_for(all_entered.wait(), 1)
+            assert active == 3
+        finally:
+            release.set()
+            await asyncio.gather(*callers, return_exceptions=True)
+        results = await asyncio.gather(*callers)
+        assert [result["reward_score"] for result in results] == [1.0, 1.0, 1.0]
         assert active == 0
 
     manager.loop.run_until_complete(scenario())
@@ -961,55 +1002,34 @@ def test_repeated_cancellation_drains_active_and_queued_terms_in_one_window():
     manager.loop.run_until_complete(scenario())
 
 
-def test_cancelled_sync_barrier_retains_permit_until_thread_exits():
-    manager = _manager({"barrier": _term("_sync_score")}, concurrency=2)
-    two_entered = threading.Event()
+@pytest.mark.parametrize("concurrency", [1, 2])
+def test_cancelled_sync_barrier_returns_before_executor_thread_exits(concurrency):
+    manager = _manager({"barrier": _term("_sync_score")}, concurrency=concurrency)
+    entered = threading.Event()
     release = threading.Event()
-    entered = []
-    exited = []
-    lock = threading.Lock()
+    exited = threading.Event()
 
     def scorer(data_source):
-        with lock:
-            entered.append(data_source)
-            if len(entered) == 2:
-                two_entered.set()
+        entered.set()
         try:
             release.wait()
             return 1.0
         finally:
-            with lock:
-                exited.append(data_source)
+            exited.set()
 
     _replace(manager, "barrier", scorer)
 
     async def scenario():
-        callers = [asyncio.create_task(manager.run_single(_sample(str(i)))) for i in range(2)]
+        caller = asyncio.create_task(manager.run_single(_sample("blocked")))
         try:
-            assert await asyncio.to_thread(two_entered.wait, 1)
-            queued = asyncio.create_task(manager.run_single(_sample("queued")))
-
-            async def wait_for_waiter():
-                while not manager._multi_reward_semaphore._waiters:
-                    await asyncio.sleep(0)
-
-            await asyncio.wait_for(wait_for_waiter(), 1)
-            callers[0].cancel()
-            await asyncio.sleep(0)
-            callers[0].cancel()
-            await asyncio.sleep(0)
-            assert not callers[0].done()
-            assert sorted(entered) == ["0", "1"]
-            assert exited == []
-            assert not queued.done()
+            assert await asyncio.to_thread(entered.wait, 1)
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(caller), 1)
+            assert not exited.is_set()
         finally:
             release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await callers[0]
-        assert (await callers[1])["reward_score"] == 1.0
-        assert (await queued)["reward_score"] == 1.0
-        assert sorted(entered) == ["0", "1", "queued"]
-        assert sorted(exited) == ["0", "1", "queued"]
-        assert (await manager.run_single(_sample("again")))["reward_score"] == 1.0
+            assert await asyncio.to_thread(exited.wait, 1)
+            await asyncio.gather(caller, return_exceptions=True)
 
     manager.loop.run_until_complete(scenario())
