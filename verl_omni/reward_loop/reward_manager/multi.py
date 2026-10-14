@@ -25,6 +25,7 @@ from verl import DataProto
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
 from verl.utils.import_utils import load_extern_object
 
+from verl_omni.pipelines.rollout_media import ArtifactContractError
 from verl_omni.workers.config.reward import get_reward_model_entries, resolve_reward_model_name
 
 from .media import _reward_extra_info
@@ -312,6 +313,8 @@ class MultiRewardManager(RewardManagerBase, ABC):
                     if isinstance(result, BaseException):
                         if not isinstance(result, Exception):
                             raise result
+                        if isinstance(result, ArtifactContractError):
+                            raise result
                         if term["required"]:
                             raise RuntimeError(f"Required sub-reward '{key}' failed: {result}") from result
                         logger.error(
@@ -331,6 +334,8 @@ class MultiRewardManager(RewardManagerBase, ABC):
                                         reward_extra_info[f"reward/{key}/{rk}"] = rv
                             else:
                                 score = float(result)
+                        except ArtifactContractError:
+                            raise
                         except Exception as exc:
                             if term["required"]:
                                 raise RuntimeError(f"Required sub-reward '{key}' failed: {exc}") from exc
@@ -368,13 +373,14 @@ class MultiVisualRewardManager(MultiRewardManager):
     async def _build_reward_kwargs(self, data_item: DataProto) -> dict:
         """Preserve the existing visual manager input and router contract."""
         response_visual = data_item.batch["responses"]
+        batch = data_item.non_tensor_batch
+        extra_info = _reward_extra_info(data_item)
         _validate_visual_response(
             response_visual,
             self.config,
             is_validate=data_item.meta_info.get("validate", False),
+            extra_info=extra_info,
         )
-        batch = data_item.non_tensor_batch
-        extra_info = _reward_extra_info(data_item)
         extra_info["num_turns"] = batch.get("__num_turns__", None)
         extra_info["rollout_reward_scores"] = batch.get("reward_scores", {})
 

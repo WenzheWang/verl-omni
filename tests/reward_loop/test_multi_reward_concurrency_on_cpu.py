@@ -25,7 +25,16 @@ from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 from verl import DataProto
 
+from verl_omni.pipelines.rollout_media import (
+    ArtifactContractError,
+    MediaArtifact,
+    MediaSpec,
+    artifact_fields,
+    select_artifact,
+)
 from verl_omni.reward_loop.reward_manager.multi import MultiVisualRewardManager
+from verl_omni.utils.reward_score.clap import _get_audio
+from verl_omni.utils.reward_score.reward_utils import video_reward_tensor
 
 REWARDS_PATH = "tests/reward_loop/test_multi_reward_concurrency_on_cpu.py"
 _DEFAULT = object()
@@ -80,9 +89,37 @@ def _sample(name):
         non_tensors={
             "data_source": [name],
             "reward_model": [{"ground_truth": "ground truth"}],
+            "media_kind": ["image"],
             "extra_info": [{}],
         },
     )
+
+
+def _named_sample():
+    latent = torch.arange(128, dtype=torch.float16).reshape(16, 2, 2, 2)
+    preview = torch.arange(36, dtype=torch.uint8).reshape(3, 3, 2, 2)
+    audio = torch.arange(16, dtype=torch.float32).reshape(1, 16)
+    fields = artifact_fields(
+        {
+            "video_latent": MediaArtifact(MediaSpec("video", "latent", "CTHW"), latent),
+            "video_preview": MediaArtifact(MediaSpec("video", "decoded", "TCHW", fps=24), preview),
+            "audio": MediaArtifact(MediaSpec("audio", "decoded", "CT", sample_rate=32000), audio),
+        },
+        "video_latent",
+        "video_preview",
+    )
+    sample = DataProto.from_dict(
+        tensors={
+            "responses": latent.unsqueeze(0),
+            **{key: value.unsqueeze(0) for key, value in fields.items() if isinstance(value, torch.Tensor)},
+        },
+        non_tensors={
+            "data_source": ["named"],
+            "reward_model": [{"ground_truth": "prompt"}],
+            **{key: [value] for key, value in fields.items() if not isinstance(value, torch.Tensor)},
+        },
+    )
+    return sample, latent, preview, audio
 
 
 def _replace(manager, key, scorer):
@@ -160,6 +197,121 @@ def test_batch_and_reserved_kwargs_through_serial_and_independent_paths(independ
     assert seen == ["explicit", "kwargs_only"]
     assert result["reward_score"] == 3.0
     assert list(result["reward_extra_info"]) == ["reward/explicit", "reward/kwargs_only", "reward/combined"]
+
+
+@pytest.mark.parametrize("independent", [False, True])
+def test_named_media_reaches_each_term_through_real_run_single(independent):
+    manager = _manager(
+        {"visual": _term(independent=independent), "audio": _term(independent=independent)},
+        concurrency=2,
+    )
+    sample, latent, preview, audio = _named_sample()
+    seen = []
+
+    async def visual(batch, solution_image, extra_info):
+        assert batch is sample
+        torch.testing.assert_close(solution_image, latent)
+        selected = video_reward_tensor(solution_image, extra_info, fps=24)
+        torch.testing.assert_close(selected, preview)
+        assert extra_info["primary_artifact"] == "video_latent"
+        assert extra_info["preview_artifact"] == "video_preview"
+        seen.append("visual")
+        return {"score": 1.0}
+
+    async def audio_term(batch, solution_image, extra_info):
+        assert batch is sample
+        torch.testing.assert_close(solution_image, latent)
+        waveform, rate = _get_audio(extra_info)
+        torch.testing.assert_close(waveform, audio[0])
+        assert rate == 32000
+        seen.append("audio")
+        return {"score": 2.0}
+
+    _replace(manager, "visual", visual)
+    _replace(manager, "audio", audio_term)
+    result = manager.loop.run_until_complete(manager.run_single(sample))
+    assert sorted(seen) == ["audio", "visual"]
+    assert result["reward_score"] == 3.0
+    assert list(result["reward_extra_info"]) == ["reward/visual", "reward/audio", "reward/combined"]
+
+
+@pytest.mark.parametrize("independent", [False, True])
+def test_optional_artifact_contract_error_is_fatal_in_both_execution_paths(independent):
+    terms = {"bad": _term(independent=independent, required=False)}
+    if independent:
+        terms["peer"] = _term(independent=True)
+    manager = _manager(terms, concurrency=2)
+    sample, _, _, _ = _named_sample()
+
+    async def scenario():
+        bad_started = asyncio.Event()
+        bad_finished = asyncio.get_running_loop().create_future()
+        peer_started = asyncio.Event()
+        peer_release = asyncio.Event()
+        peer_settled = asyncio.Event()
+
+        async def bad(extra_info):
+            bad_started.set()
+            if independent:
+                await peer_started.wait()
+            try:
+                select_artifact(
+                    extra_info["media_artifacts"],
+                    name="missing_preview",
+                    modality="video",
+                    representation="decoded",
+                )
+            except ArtifactContractError:
+                if independent:
+                    loop = asyncio.get_running_loop()
+                    asyncio.current_task().add_done_callback(lambda _: loop.call_soon(bad_finished.set_result, None))
+                raise
+
+        async def peer(batch):
+            assert batch is sample
+            peer_started.set()
+            try:
+                await peer_release.wait()
+                return 2.0
+            finally:
+                peer_settled.set()
+
+        _replace(manager, "bad", bad)
+        if independent:
+            _replace(manager, "peer", peer)
+        caller = asyncio.create_task(manager.run_single(sample))
+        try:
+            await asyncio.wait_for(bad_started.wait(), 1)
+            if independent:
+                await asyncio.wait_for(peer_started.wait(), 1)
+                await asyncio.wait_for(bad_finished, 1)
+                assert not caller.done()
+                assert not peer_settled.is_set()
+        finally:
+            peer_release.set()
+            await asyncio.gather(caller, return_exceptions=True)
+        with pytest.raises(ArtifactContractError, match="missing_preview.*absent"):
+            await caller
+        if independent:
+            assert peer_settled.is_set()
+
+    manager.loop.run_until_complete(scenario())
+
+
+@pytest.mark.parametrize("independent", [False, True])
+def test_artifact_contract_error_during_score_conversion_is_not_optional(independent):
+    manager = _manager({"bad": _term(independent=independent, required=False)}, concurrency=2)
+
+    class InvalidScore:
+        def __float__(self):
+            raise ArtifactContractError("score references an invalid artifact")
+
+    async def bad(data_source):
+        return {"score": InvalidScore()}
+
+    _replace(manager, "bad", bad)
+    with pytest.raises(ArtifactContractError, match="invalid artifact"):
+        manager.loop.run_until_complete(manager.run_single(_sample("one")))
 
 
 def test_native_barrier_keeps_batch_binding_and_valid_fps_after_independent_window():

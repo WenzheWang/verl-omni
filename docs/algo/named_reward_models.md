@@ -1,6 +1,6 @@
 # Named Reward Models
 
-Last updated: 10/13/2026
+Last updated: 10/14/2026
 
 This guide describes how to configure and extend named model-backed rewards
 under `reward.models` in `verl-omni`. For the general Reward Loop interface and
@@ -237,7 +237,8 @@ final_reward = sum(term.weight * term.score)
 
 `required=true` makes a scoring failure fatal. An optional term records the
 error and contributes zero. Model setup and lifecycle failures are always
-fatal.
+fatal. `ArtifactContractError` is fatal for every term, including optional
+terms, so missing or invalid named media cannot silently contribute zero.
 
 ## Concurrent independent reward terms
 
@@ -274,6 +275,7 @@ samples handled by one reward worker. Scores, diagnostics,
 and required/optional error handling remain in configuration order. The cap
 limits active scorer calls, not the number of reward workers or engine-side
 requests. Increasing it does not establish a throughput improvement by itself.
+An admitted window settles all its terms before reporting a contract error.
 
 ## Component rewards and consumer support
 
