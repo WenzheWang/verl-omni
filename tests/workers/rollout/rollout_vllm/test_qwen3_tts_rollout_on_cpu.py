@@ -447,7 +447,7 @@ async def test_ar_strategy_retains_requested_stage_outputs_and_targets_weight_sy
     assert strategy._rollout_fields_by_request_id == {"request-0": {"audio_sample_rate": 24_000}}
     assert server.engine.generate_kwargs["output_modalities"] == ["latent", "audio"]
     assert server.engine.rpc_kwargs["stage_ids"] == [0]
-    assert rpc_result is None
+    assert rpc_result == [None]
 
     output = strategy.process_output(result, SamplingParams(), {})
     assert output.extra_fields == {"global_steps": 3, "audio_sample_rate": 24_000}

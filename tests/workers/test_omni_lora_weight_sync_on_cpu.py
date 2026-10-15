@@ -139,7 +139,10 @@ def test_lora_fast_path_stamp_gated_to_rollout_rank_zero():
     ],
 )
 def test_lora_fast_path_rejected_rpc_does_not_publish_weight_version(reply, stage_ids):
-    from verl_omni.workers.rollout.vllm_rollout.vllm_omni_async_server import vLLMOmniHttpServer
+    from verl_omni.workers.rollout.vllm_rollout.vllm_omni_async_server import (
+        vLLMOmniHttpServer,
+        vLLMOmniServerAdapter,
+    )
 
     worker = _fast_path_worker()
     server = object.__new__(vLLMOmniHttpServer)
@@ -149,15 +152,29 @@ def test_lora_fast_path_rejected_rpc_does_not_publish_weight_version(reply, stag
     )
     server._generate_strategy = SimpleNamespace(collective_rpc_stage_ids=lambda method: stage_ids)
 
-    async def execute(method, non_block, kwargs):
-        assert method == "update_weights_from_ipc"
-        assert non_block is True
-        return asyncio.create_task(server.collective_rpc(method, kwargs=kwargs))
+    rollout = object.__new__(vLLMOmniServerAdapter)
+    rollout.zmq_handle = worker.rollout.zmq_handle
+    rollout.use_shm = worker.rollout.use_shm
+    rollout.rollout_rank = worker.rollout.rollout_rank
+    rollout._ensure_server_handle = MagicMock(return_value=True)
+    rpc_calls = []
 
-    worker.rollout._execute_method = AsyncMock(side_effect=execute)
+    def remote(method, **kwargs):
+        rpc_calls.append((method, kwargs))
+        return asyncio.create_task(server.collective_rpc(method, **kwargs))
+
+    rollout.server_handle = SimpleNamespace(
+        collective_rpc=SimpleNamespace(remote=remote),
+        clear_kv_cache=SimpleNamespace(remote=AsyncMock()),
+        set_global_steps=SimpleNamespace(remote=AsyncMock()),
+    )
+    worker.rollout = rollout
     with pytest.raises(RuntimeError, match="update_weights_from_ipc failed"):
         _run_update(worker, global_steps=7)
 
+    assert len(rpc_calls) == 1
+    assert rpc_calls[0][0] == "update_weights_from_ipc"
+    assert rpc_calls[0][1]["require_ack"] is True
     assert server.engine.collective_rpc.await_count == len(stage_ids)
     worker.rollout.server_handle.clear_kv_cache.remote.assert_not_awaited()
     worker.rollout.server_handle.set_global_steps.remote.assert_not_awaited()
