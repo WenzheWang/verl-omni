@@ -22,10 +22,12 @@ and are never moved.
 from verl_omni.utils.reward_score.scorers.base import RewardScorer
 
 # Importing a scorer module registers it; keep in sync with the scorer modules above.
+from verl_omni.utils.reward_score.scorers.clap import CLAPScorer
 from verl_omni.utils.reward_score.scorers.pickscore import PickScoreScorer
 from verl_omni.utils.reward_score.scorers.registry import get_scorer_cls, peek_registered_scorers, register_scorer
 
 __all__ = [
+    "CLAPScorer",
     "PickScoreScorer",
     "RewardScorer",
     "get_scorer_cls",

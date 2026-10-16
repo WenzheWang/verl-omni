@@ -1,7 +1,7 @@
 (integrating_a_reward_scorer)=
 # How to Integrate a Reward Scorer
 
-Last updated: 10/15/2026.
+Last updated: 10/16/2026.
 
 This guide covers adding a **reward scorer** to VeRL-Omni: the function or class
 that turns one generated sample into a score. Most scorers are a single
@@ -123,6 +123,24 @@ reference that resolves to a non-`RewardScorer` class is rejected. The
 `executor.model` config key currently requires an import-spec form;
 bare registered names (`executor.model=pickscore`) are not yet accepted by
 the config validation.
+
+### CLAP opt-in
+
+CLAP uses the same native-model association, with model construction options
+owned by the executor and per-request scoring options forwarded by the wrapper:
+
+```bash
++reward.models.clap.backend=native \
++reward.models.clap.placement.devices=[0] \
++reward.models.clap.executor.model=pkg://verl_omni.utils.reward_score.scorers.clap:CLAPScorer \
++reward.models.clap.executor.kwargs.model_path=laion/larger_clap_general \
+"+reward.reward_functions.clap.path=pkg://verl_omni.utils.reward_score.scorers.clap" \
++reward.reward_functions.clap.name=compute_score_clap_batched \
++reward.reward_functions.clap.model=clap
+```
+
+The wrapper accepts the legacy CLAP request options (`batch`, `audio_layout`,
+`prompt_key`, and score calibration fields) without managing model lifecycle.
 
 ## Tests
 
