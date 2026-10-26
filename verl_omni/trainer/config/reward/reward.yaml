@@ -31,7 +31,7 @@ accelerator_workers:
 
 # Multi-reward configuration (dict-based, mutually exclusive with custom_reward_function).
 # Keys are user-chosen names used for metric logging (e.g., "ocr", "jpeg").
-# Each entry uses path/name/weight and optional required/model fields.
+# Each entry uses path/name/weight; preserve_components requires required=true and ignores weight.
 reward_functions: {}
 
 # At values above 1, maximum concurrent independent sub-reward calls per
@@ -46,7 +46,7 @@ multi_reward_concurrency: 1
 # and extension instructions.
 models: {}
 
-# Aggregation method for multi-reward. "preserve_components" is reserved and currently rejected.
+# Aggregation method for multi-reward: "weighted_sum" or "preserve_components".
 aggregation: weighted_sum
 
 # reward manager configuration
