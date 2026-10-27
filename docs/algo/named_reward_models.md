@@ -1,6 +1,6 @@
 # Named Reward Models
 
-Last updated: 10/23/2026
+Last updated: 10/27/2026
 
 This guide describes how to configure and extend named model-backed rewards
 under `reward.models` in `verl-omni`. For the general Reward Loop interface and
@@ -229,6 +229,27 @@ reward_functions:
     name: compute_semantic_quality
 ```
 
+### VLM-as-a-judge
+
+One judge model can serve several reward terms, each with its own `user_prompt`
+(literal text, or a `pkg://` builder). For UnifiedReward, literal text may contain
+`{caption}`, and a custom builder receives the caption. Leaving `user_prompt`
+unset keeps the scorer's default request.
+
+```yaml
+reward_functions:
+  ocr:
+    model: judge
+    path: pkg://verl_omni.utils.reward_score.genrm_ocr
+    name: compute_score_ocr
+    user_prompt: "Transcribe all text in the image exactly."
+  semantics:
+    model: judge
+    path: pkg://verl_omni.utils.reward_score.unified_reward
+    name: compute_score_unified_reward
+    user_prompt: pkg://my_package.prompts.build_semantic_prompt
+```
+
 Every term uses the existing aggregation contract:
 
 ```text
@@ -273,6 +294,11 @@ Adjacent independent terms execute in windows of at most
 sample. When the cap is above one, it bounds active independent scorer calls
 across all samples handled by one reward worker. Barriers do not use the cap
 and retain cross-sample concurrency, even while independent calls are active.
+Each window waits for all its terms to settle before admitting the next window
+for that sample, even if one term finishes and frees a semaphore permit while
+another is still running. This bounds the number of admitted tasks rather than
+enqueueing every term at once; a freed permit remains available to independent
+terms from other samples.
 Scores, diagnostics, and required/optional error handling remain in
 configuration order. The cap does not limit reward workers, barrier calls, or
 engine-side requests. Increasing it does not establish a throughput
@@ -280,6 +306,9 @@ improvement by itself. Cancelling a serial synchronous scorer stops its caller
 without waiting for its executor thread; the thread may continue until the
 scorer returns.
 An admitted window settles all its terms before reporting a contract error.
+Independent async scorers must cooperate with cancellation. A scorer that
+swallows `CancelledError` can block window drain and permit release; the manager
+does not impose a timeout or preempt it.
 
 ## Component rewards and consumer support
 

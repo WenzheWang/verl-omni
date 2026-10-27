@@ -33,8 +33,7 @@ from verl_omni.pipelines.rollout_media import (
     select_artifact,
 )
 from verl_omni.reward_loop.reward_manager.multi import MultiVisualRewardManager
-from verl_omni.utils.reward_score.clap import _get_audio
-from verl_omni.utils.reward_score.reward_utils import video_reward_tensor
+from verl_omni.utils.reward_score.reward_utils import get_audio, video_reward_tensor
 
 REWARDS_PATH = "tests/reward_loop/test_multi_reward_concurrency_on_cpu.py"
 _DEFAULT = object()
@@ -221,7 +220,7 @@ def test_named_media_reaches_each_term_through_real_run_single(independent):
     async def audio_term(batch, solution_image, extra_info):
         assert batch is sample
         torch.testing.assert_close(solution_image, latent)
-        waveform, rate = _get_audio(extra_info)
+        waveform, rate = get_audio(extra_info)
         torch.testing.assert_close(waveform, audio[0])
         assert rate == 32000
         seen.append("audio")
@@ -656,34 +655,56 @@ def test_contiguous_terms_are_admitted_in_bounded_windows():
     manager = _manager({key: _term(independent=True) for key in ("first", "second", "third")}, concurrency=2)
 
     async def scenario():
-        first_window = asyncio.Event()
-        release = asyncio.Event()
+        first_finished = asyncio.Event()
+        second_started = asyncio.Event()
+        release_second = asyncio.Event()
         third_started = asyncio.Event()
-        started = 0
 
-        async def early(data_source):
-            nonlocal started
-            started += 1
-            if started == 2:
-                first_window.set()
-            await release.wait()
+        async def first(data_source):
+            await second_started.wait()
+            first_finished.set()
             return 1.0
+
+        async def second(data_source):
+            second_started.set()
+            await release_second.wait()
+            return 2.0
 
         async def third(data_source):
             third_started.set()
-            return 1.0
+            return 3.0
 
-        _replace(manager, "first", early)
-        _replace(manager, "second", early)
+        _replace(manager, "first", first)
+        _replace(manager, "second", second)
         _replace(manager, "third", third)
         task = asyncio.create_task(manager.run_single(_sample("one")))
         try:
-            await asyncio.wait_for(first_window.wait(), 1)
-            assert started == 2
+            await asyncio.wait_for(first_finished.wait(), 1)
+
+            async def wait_for_free_permit():
+                while manager._multi_reward_semaphore._value == 0:
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(wait_for_free_permit(), 1)
+            await asyncio.sleep(0)
+            assert manager._multi_reward_semaphore._value == 1
+            assert not task.done()
             assert not third_started.is_set()
+        except BaseException:
+            task.cancel()
+            raise
         finally:
-            release.set()
-        assert (await task)["reward_score"] == 3.0
+            release_second.set()
+            settled = asyncio.gather(task, return_exceptions=True)
+            await asyncio.wait_for(asyncio.shield(settled), 1)
+        result = task.result()
+        assert result["reward_score"] == 6.0
+        assert list(result["reward_extra_info"].items()) == [
+            ("reward/first", 1.0),
+            ("reward/second", 2.0),
+            ("reward/third", 3.0),
+            ("reward/combined", 6.0),
+        ]
         assert third_started.is_set()
 
     manager.loop.run_until_complete(scenario())
