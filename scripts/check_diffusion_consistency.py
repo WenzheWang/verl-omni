@@ -36,16 +36,21 @@ _INPUTS = ("hidden_states", "prompt_embeds", "pooled_projections")
 
 
 def _require(ok: bool, message: str) -> None:
+    """Reject a violated artifact contract with its specific reason."""
     if not ok:
         raise ValueError(message)
 
 
 def _digest(data: bytes) -> str:
+    """Return the lowercase SHA256 digest used by pin entries."""
     return hashlib.sha256(data).hexdigest()
 
 
 def _json(data: bytes, label: str) -> Any:
+    """Decode strict UTF-8 JSON without duplicate keys or nonfinite numbers."""
+
     def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        """Build an object while rejecting repeated JSON keys."""
         result: dict[str, Any] = {}
         for key, value in pairs:
             _require(key not in result, f"{label}: duplicate JSON key {key}")
@@ -53,6 +58,7 @@ def _json(data: bytes, label: str) -> Any:
         return result
 
     def nonfinite(value: str) -> None:
+        """Reject JSON extensions for nonfinite numeric literals."""
         raise ValueError(f"{label}: nonfinite JSON number {value}")
 
     try:
@@ -62,6 +68,7 @@ def _json(data: bytes, label: str) -> Any:
 
 
 def _number(value: Any, label: str, nonnegative: bool = False) -> float:
+    """Validate a finite JSON number and its optional sign constraint."""
     _require(type(value) in (int, float), f"{label} must be a JSON number")
     try:
         number = float(value)
@@ -72,6 +79,7 @@ def _number(value: Any, label: str, nonnegative: bool = False) -> float:
 
 
 def _step(value: Any) -> int:
+    """Normalize an integer or canonical signed integer step."""
     _require(
         type(value) is int or (type(value) is str and _STEP.fullmatch(value) is not None),
         "global_step must be an integer or canonical signed integer string",
@@ -80,6 +88,7 @@ def _step(value: Any) -> int:
 
 
 def _relative(root: Path, name: Any) -> Path:
+    """Resolve a regular artifact file without symlinks or root escape."""
     _require(type(name) is str and bool(name), "artifact path must be a nonempty relative string")
     raw = Path(name)
     _require(not raw.is_absolute() and ".." not in raw.parts and raw.as_posix() == name, "invalid relative path")
@@ -94,6 +103,7 @@ def _relative(root: Path, name: Any) -> Path:
 
 
 def _pins(root: Path, pin_name: str, external_sha: str, manifest_name: str) -> dict[str, bytes]:
+    """Verify the external pin digest and return every pinned file's bytes."""
     _require(type(external_sha) is str and _HEX64.fullmatch(external_sha) is not None, "invalid external pins SHA256")
     pin_path = _relative(root, pin_name)
     pin_bytes = pin_path.read_bytes()
@@ -118,6 +128,7 @@ def _pins(root: Path, pin_name: str, external_sha: str, manifest_name: str) -> d
 
 
 def _input(item: Any, label: str) -> dict[str, Any]:
+    """Validate one declared input provenance record."""
     _require(type(item) is dict and set(item) == {"sha256", "dtype", "shape"}, f"{label} must have exact metadata")
     _require(type(item["sha256"]) is str and _HEX64.fullmatch(item["sha256"]) is not None, f"{label} SHA256 invalid")
     _require(type(item["dtype"]) is str and bool(item["dtype"].strip()), f"{label} dtype missing")
@@ -129,6 +140,7 @@ def _input(item: Any, label: str) -> dict[str, Any]:
 
 
 def _dump(data: bytes, label: str) -> None:
+    """Validate the required Module entry in a pinned dump."""
     payload = _json(data, label)
     _require(type(payload) is dict and type(payload.get("data")) is dict, f"{label} needs object data")
     _require(
@@ -141,6 +153,7 @@ def _dump(data: bytes, label: str) -> None:
 
 
 def _pairs(records: Any, expected: dict[str, Any], root: Path, pinned: dict[str, bytes]) -> list[dict[str, Any]]:
+    """Pair actor and rollout records after validating shared provenance."""
     _require(type(records) is list and bool(records), "records must be a nonempty list")
     grouped: dict[tuple[str, int, str], dict[str, dict[str, Any]]] = {}
     seen_dumps: set[str] = set()
@@ -211,6 +224,7 @@ def check(root: Path, manifest_name: str, pin_name: str, external_sha: str, outp
     Raises:
         ValueError: Artifact bytes or declared metadata violate the contract.
         RuntimeError: The numeric comparison is outside declared tolerances.
+        MemoryError: Tensor loading exhausts available memory.
     """
     root = root.resolve(strict=True)
     _require(root.is_dir(), "root must be a directory")
@@ -265,7 +279,12 @@ def check(root: Path, manifest_name: str, pin_name: str, external_sha: str, outp
 
     import torch
 
-    tensors = torch.load(io.BytesIO(pinned[comparison_path]), map_location="cpu", weights_only=True)
+    try:
+        tensors = torch.load(io.BytesIO(pinned[comparison_path]), map_location="cpu", weights_only=True)
+    except MemoryError:
+        raise
+    except Exception as exc:
+        raise ValueError("comparison tensor artifact cannot be decoded") from exc
     _require(
         type(tensors) is dict and set(tensors) == {"actor_log_probs", "rollout_log_probs"},
         "comparison tensor map invalid",

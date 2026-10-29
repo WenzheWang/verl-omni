@@ -31,6 +31,7 @@ SPEC.loader.exec_module(checker)
 
 
 def _fixture(tmp_path, keys=None, delta=0.0):
+    """Build a pinned comparison fixture with paired rollout and actor records."""
     keys = keys or [["sample-a", 0, "cond"]]
     root = tmp_path / "input"
     root.mkdir()
@@ -87,6 +88,7 @@ def _fixture(tmp_path, keys=None, delta=0.0):
 
 
 def _repin(root):
+    """Rewrite the pin list after a fixture mutation and return its digest."""
     paths = ["manifest.json", "comparison.pt"] + sorted(
         str(path.relative_to(root)) for path in (root / "dumps").glob("*.json")
     )
@@ -97,18 +99,22 @@ def _repin(root):
 
 
 def _check(root, output):
+    """Check a fixture using its current pinned bytes."""
     return checker.check(root, "manifest.json", "pins.sha256", _repin(root), output)
 
 
 def _manifest(root):
+    """Read the fixture manifest for a targeted mutation."""
     return json.loads((root / "manifest.json").read_text())
 
 
 def _save_manifest(root, manifest):
+    """Save a mutated fixture manifest before repinning."""
     (root / "manifest.json").write_text(json.dumps(manifest))
 
 
 def test_admits_single_and_permuted_multiple_pairs(tmp_path):
+    """Accept complete pairs regardless of record ordering."""
     root, output = _fixture(tmp_path)
     assert _check(root, output)["pair_count"] == 1
     second = tmp_path / "second"
@@ -123,6 +129,7 @@ def test_admits_single_and_permuted_multiple_pairs(tmp_path):
 
 
 def test_relocates_root_with_relative_pins(tmp_path):
+    """Accept a relocated artifact rooted at the same relative paths."""
     root, output = _fixture(tmp_path)
     digest = _repin(root)
     relocated = tmp_path / "relocated"
@@ -132,6 +139,7 @@ def test_relocates_root_with_relative_pins(tmp_path):
 
 @pytest.mark.parametrize("damage", ["duplicate", "nonfinite", "boolean"])
 def test_rejects_strict_manifest_json(tmp_path, damage):
+    """Reject duplicate keys, nonfinite numbers, and boolean steps."""
     root, output = _fixture(tmp_path)
     if damage == "duplicate":
         (root / "manifest.json").write_text('{"version":1,"version":1}')
@@ -148,6 +156,7 @@ def test_rejects_strict_manifest_json(tmp_path, damage):
 
 @pytest.mark.parametrize("damage", ["wrong_external", "missing", "extra", "duplicate", "bad_line", "bad_hash"])
 def test_rejects_pins_and_bytes_before_tensor_load(tmp_path, damage, monkeypatch):
+    """Reject broken pin contracts before attempting tensor decode."""
     root, output = _fixture(tmp_path)
     digest = _repin(root)
     if damage == "wrong_external":
@@ -172,6 +181,7 @@ def test_rejects_pins_and_bytes_before_tensor_load(tmp_path, damage, monkeypatch
 
 
 def test_rejects_coordinated_metadata_forgery_without_external_repin(tmp_path):
+    """Reject a rewritten manifest and pin list without a new external digest."""
     root, output = _fixture(tmp_path)
     digest = _repin(root)
     manifest = _manifest(root)
@@ -196,6 +206,7 @@ def test_rejects_coordinated_metadata_forgery_without_external_repin(tmp_path):
     ],
 )
 def test_rejects_mismatched_pair_metadata(tmp_path, field, value):
+    """Reject actor and rollout records with inconsistent provenance."""
     root, output = _fixture(tmp_path)
     manifest = _manifest(root)
     manifest["records"][1][field] = value
@@ -206,6 +217,7 @@ def test_rejects_mismatched_pair_metadata(tmp_path, field, value):
 
 @pytest.mark.parametrize("damage", ["duplicate", "unpaired", "wrong_rows", "duplicate_rows"])
 def test_rejects_pair_cardinality_or_row_map(tmp_path, damage):
+    """Reject incomplete pairs and comparison row mapping errors."""
     root, output = _fixture(tmp_path)
     manifest = _manifest(root)
     if damage == "duplicate":
@@ -226,6 +238,7 @@ def test_rejects_pair_cardinality_or_row_map(tmp_path, damage):
     ["map", "non_tensor", "parameter", "requires_grad", "dtype", "shape", "rows", "nonfinite", "numeric", "extreme"],
 )
 def test_rejects_invalid_or_out_of_tolerance_tensors(tmp_path, damage):
+    """Separate invalid tensor artifacts from reported numeric mismatches."""
     root, output = _fixture(tmp_path)
     tensors = torch.load(root / "comparison.pt", map_location="cpu", weights_only=True)
     if damage == "map":
@@ -261,7 +274,43 @@ def test_rejects_invalid_or_out_of_tolerance_tensors(tmp_path, damage):
             _check(root, output)
 
 
+@pytest.mark.parametrize("damage", ["empty", "garbage", "truncated_zip", "unsafe_object"])
+def test_rejects_undecodable_pinned_comparison(tmp_path, damage):
+    """Treat validly pinned but undecodable tensor bytes as invalid artifacts."""
+    root, output = _fixture(tmp_path)
+    comparison = root / "comparison.pt"
+    if damage == "empty":
+        comparison.write_bytes(b"")
+    elif damage == "garbage":
+        comparison.write_bytes(b"not a torch archive")
+    elif damage == "truncated_zip":
+        comparison.write_bytes(comparison.read_bytes()[:32])
+    else:
+        buffer = io.BytesIO()
+        torch.save(Path("safe-test-path"), buffer)
+        comparison.write_bytes(buffer.getvalue())
+    with pytest.raises(ValueError, match="comparison tensor artifact cannot be decoded") as raised:
+        _check(root, output)
+    assert raised.value.__cause__ is not None
+    assert not output.exists()
+
+
+def test_preserves_tensor_load_memory_error(tmp_path, monkeypatch):
+    """Leave resource failures outside the invalid-artifact contract."""
+    root, output = _fixture(tmp_path)
+
+    def fail_load(*args, **kwargs):
+        """Simulate resource exhaustion at the tensor decode boundary."""
+        raise MemoryError("tensor load exhausted memory")
+
+    monkeypatch.setattr(torch, "load", fail_load)
+    with pytest.raises(MemoryError, match="tensor load exhausted memory"):
+        _check(root, output)
+    assert not output.exists()
+
+
 def test_output_exclusivity_and_input_path_escape(tmp_path):
+    """Require a fresh external report path and confined input paths."""
     root, output = _fixture(tmp_path)
     _check(root, output)
     with pytest.raises(ValueError, match="fresh"):
@@ -282,6 +331,7 @@ def test_output_exclusivity_and_input_path_escape(tmp_path):
 
 
 def test_rejects_symlinked_pinned_input(tmp_path):
+    """Reject a pinned file that resolves through a symlink."""
     root, output = _fixture(tmp_path)
     dump = root / "dumps" / "sample-a-0-actor.json"
     outside = tmp_path / "outside.json"
@@ -293,6 +343,7 @@ def test_rejects_symlinked_pinned_input(tmp_path):
 
 
 def test_cli_success_and_numeric_failure(tmp_path):
+    """Preserve CLI exit behavior for admitted and mismatched artifacts."""
     root, output = _fixture(tmp_path)
     digest = _repin(root)
     base = [
