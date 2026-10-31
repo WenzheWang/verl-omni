@@ -305,7 +305,7 @@ def check(root: Path, manifest_name: str, pin_name: str, external_sha: str, outp
         )
     _require(actor.shape == rollout.shape, "log-probability tensor shapes differ")
     maxdiff = max(abs(float(a) - float(b)) for a, b in zip(actor.flatten(), rollout.flatten(), strict=True))
-    close = bool(torch.allclose(actor, rollout, atol=atol, rtol=rtol))
+    close = bool(torch.allclose(actor.double(), rollout.double(), atol=atol, rtol=rtol))
     report = {
         "status": "admitted" if close else "numerical_mismatch",
         "declared_policy_id": expected["policy_id"],

@@ -17,6 +17,7 @@
 import importlib.util
 import io
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -318,6 +319,56 @@ def test_rejects_invalid_or_out_of_tolerance_tensors(tmp_path, damage):
     else:
         with pytest.raises(ValueError):
             _check(root, output)
+
+
+@pytest.mark.parametrize("sign", [-1.0, 1.0])
+@pytest.mark.parametrize("tolerance", ["below_rtol", "at_rtol", "above_rtol", "at_atol"])
+def test_extreme_finite_tolerance_boundary(tmp_path, sign, tolerance):
+    """Compare extreme finite inputs without overflowing the tolerance decision."""
+    root, output = _fixture(tmp_path)
+    limit = float(torch.finfo(torch.float32).max)
+    tensors = torch.load(root / "comparison.pt", map_location="cpu", weights_only=True)
+    tensors["actor_log_probs"][0, 0] = sign * limit
+    tensors["rollout_log_probs"][0, 0] = -sign * limit
+    torch.save(tensors, root / "comparison.pt")
+    manifest = _manifest(root)
+    manifest["atol"] = 2.0 * limit if tolerance == "at_atol" else 0.0
+    manifest["rtol"] = {
+        "below_rtol": math.nextafter(2.0, 0.0),
+        "at_rtol": 2.0,
+        "above_rtol": math.nextafter(2.0, math.inf),
+        "at_atol": 0.0,
+    }[tolerance]
+    _save_manifest(root, manifest)
+    if tolerance == "below_rtol":
+        with pytest.raises(RuntimeError, match="numerical mismatch"):
+            _check(root, output)
+    else:
+        assert _check(root, output)["status"] == "admitted"
+    report = json.loads(output.read_text())
+    assert report["allclose"] is (tolerance != "below_rtol")
+    assert report["max_abs_logprob_difference"] == 2.0 * limit
+    assert report["atol"] == manifest["atol"] and report["rtol"] == manifest["rtol"]
+
+
+@pytest.mark.parametrize(("actor", "rollout", "accepted"), [(1.0, 2.0, True), (2.0, 1.0, False)])
+def test_preserves_rollout_relative_tolerance(tmp_path, actor, rollout, accepted):
+    """Keep the rollout tensor as the asymmetric relative-tolerance reference."""
+    root, output = _fixture(tmp_path)
+    tensors = torch.load(root / "comparison.pt", map_location="cpu", weights_only=True)
+    tensors["actor_log_probs"][0, 0] = actor
+    tensors["rollout_log_probs"][0, 0] = rollout
+    torch.save(tensors, root / "comparison.pt")
+    manifest = _manifest(root)
+    manifest.update(atol=0.0, rtol=0.5)
+    _save_manifest(root, manifest)
+    if accepted:
+        assert _check(root, output)["status"] == "admitted"
+    else:
+        with pytest.raises(RuntimeError, match="numerical mismatch"):
+            _check(root, output)
+    report = json.loads(output.read_text())
+    assert report["allclose"] is accepted and report["max_abs_logprob_difference"] == 1.0
 
 
 @pytest.mark.parametrize("damage", ["empty", "garbage", "truncated_zip", "unsafe_object"])

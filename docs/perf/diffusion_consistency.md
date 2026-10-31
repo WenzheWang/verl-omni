@@ -64,7 +64,9 @@ The example hashes are placeholders. A producer must put actual SHA256 values
 in the records. The `expected` block declares one pairing context; it is
 included in the pinned manifest. `atol` and `rtol` are required finite,
 nonnegative thresholds chosen by the caller. The script does not set a model
-specific tolerance or weight identity.
+specific tolerance or weight identity. The checker evaluates closeness in
+float64 to avoid overflow of finite float32 differences; the comparison remains
+`abs(actor - rollout) <= atol + rtol * abs(rollout)`.
 
 Write `pins.sha256` with exactly one line for the manifest, comparison tensor,
 and every unique referenced dump. Each line is a lowercase 64-character SHA256,
