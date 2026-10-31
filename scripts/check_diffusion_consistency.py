@@ -145,10 +145,10 @@ def _dump(data: bytes, label: str) -> None:
     _require(type(payload) is dict and type(payload.get("data")) is dict, f"{label} needs object data")
     _require(
         any(
-            type(key) is str and key.startswith("Module.") and type(value) is dict
+            type(key) is str and key.startswith("Module.") and type(value) is dict and bool(value)
             for key, value in payload["data"].items()
         ),
-        f"{label} needs a Module.* object",
+        f"{label} needs a nonempty Module.* object",
     )
 
 
@@ -295,12 +295,13 @@ def check(root: Path, manifest_name: str, pin_name: str, external_sha: str, outp
             type(value) is torch.Tensor
             and not value.requires_grad
             and value.device.type == "cpu"
+            and value.layout == torch.strided
             and value.dtype == torch.float32
             and value.ndim == 2
             and value.shape[0] == len(keys)
             and value.shape[1] > 0
             and bool(torch.isfinite(value).all()),
-            f"{name} must be a plain finite CPU float32 (N,T) tensor without gradients",
+            f"{name} must be a plain dense finite CPU float32 (N,T) tensor without gradients",
         )
     _require(actor.shape == rollout.shape, "log-probability tensor shapes differ")
     maxdiff = max(abs(float(a) - float(b)) for a, b in zip(actor.flatten(), rollout.flatten(), strict=True))

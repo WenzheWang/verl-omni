@@ -1,6 +1,6 @@
 # Check pinned diffusion consistency artifacts
 
-Last updated: 10/28/2026
+Last updated: 10/31/2026
 
 `scripts/check_diffusion_consistency.py` checks a saved rollout and actor
 log-probability comparison on CPU. It accepts a caller-defined manifest and an
@@ -10,7 +10,8 @@ does not require the training framework to import for `--help`.
 This is an artifact contract for a producer, not a trainer API. Collect the
 two role records from the same run, policy, sample and trajectory. Each record
 needs the actual raw scheduler timestep and the three forward-input hashes.
-Collect a `Module.*` JSON dump for each record, and save a CPU float32
+Collect a `Module.*` JSON dump with at least one nonempty module object for
+each record, and save a dense (strided) CPU float32
 `comparison.pt` containing exactly `actor_log_probs` and `rollout_log_probs`,
 each shaped `(N, T)`. `N` is the number of paired keys; `T` is positive. The
 manifest's comparison keys give the tensor row order explicitly.

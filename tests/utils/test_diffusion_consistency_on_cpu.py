@@ -233,6 +233,52 @@ def test_rejects_pair_cardinality_or_row_map(tmp_path, damage):
         _check(root, output)
 
 
+@pytest.mark.parametrize("role", ["actor", "rollout"])
+@pytest.mark.parametrize("module_name", ["Module.", "Module.block.0"])
+def test_rejects_empty_pinned_module_dump(tmp_path, role, module_name, monkeypatch):
+    """Reject empty module objects before decoding comparison tensors."""
+    root, output = _fixture(tmp_path)
+    dump = root / "dumps" / f"sample-a-0-{role}.json"
+    dump.write_text(json.dumps({"data": {module_name: {}}}))
+    monkeypatch.setattr(torch, "load", lambda *args, **kwargs: pytest.fail("tensor loaded before dump validation"))
+    with pytest.raises(ValueError, match="nonempty Module"):
+        _check(root, output)
+    assert not output.exists()
+
+
+def test_accepts_dump_with_a_nonempty_module(tmp_path):
+    """An empty entry does not hide another valid module in the dump."""
+    root, output = _fixture(tmp_path)
+    dump = root / "dumps" / "sample-a-0-actor.json"
+    dump.write_text(json.dumps({"data": {"Module.empty": {}, "Module.block.0": {"output": []}}}))
+    assert _check(root, output)["status"] == "admitted"
+
+
+@pytest.mark.parametrize("role", ["actor", "rollout"])
+@pytest.mark.parametrize("layout", ["coo", "csr"])
+def test_rejects_non_strided_pinned_tensors(tmp_path, role, layout):
+    """Reject sparse artifacts without entering unsupported numeric operations."""
+    root, output = _fixture(tmp_path)
+    tensors = torch.load(root / "comparison.pt", map_location="cpu", weights_only=True)
+    value = tensors[f"{role}_log_probs"]
+    tensors[f"{role}_log_probs"] = value.to_sparse() if layout == "coo" else value.to_sparse_csr()
+    torch.save(tensors, root / "comparison.pt")
+    with pytest.raises(ValueError, match="plain dense finite CPU float32"):
+        _check(root, output)
+    assert not output.exists()
+
+
+def test_accepts_noncontiguous_strided_tensors(tmp_path):
+    """Dense tensor views remain valid without a contiguity requirement."""
+    root, output = _fixture(tmp_path)
+    tensors = {
+        name: torch.zeros((2, 4), dtype=torch.float32)[:1, ::2] for name in ("actor_log_probs", "rollout_log_probs")
+    }
+    assert all(not value.is_contiguous() for value in tensors.values())
+    torch.save(tensors, root / "comparison.pt")
+    assert _check(root, output)["status"] == "admitted"
+
+
 @pytest.mark.parametrize(
     "damage",
     ["map", "non_tensor", "parameter", "requires_grad", "dtype", "shape", "rows", "nonfinite", "numeric", "extreme"],
